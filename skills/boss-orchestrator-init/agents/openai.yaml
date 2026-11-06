@@ -1,0 +1,5 @@
+display_name: "Boss Orchestrator Init"
+short_description: "Initialize workspace-local boss-orchestrator policy, worker routing, and execution gates."
+default_prompt: "Initialize boss orchestrator for this workspace."
+policy:
+  allow_implicit_invocation: false
