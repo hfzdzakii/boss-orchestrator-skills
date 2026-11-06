@@ -1,6 +1,6 @@
 ---
 title: boss-orchestrator runtime policy
-policy_text_version: 1
+policy_text_version: 2
 ---
 
 # boss-orchestrator runtime policy
@@ -26,7 +26,7 @@ This policy, and the `boss` block in `.setting/config.md`, bind strictly to the 
 At session start in this workspace, before the first delegation of the session:
 
 1. Verify orchestration state: read `.setting/config.md` directly (or invoke the initializer helper `status` command via its absolute path if the tool is installed) and check `scope.root` and `state`.
-2. `active`: if `state` is `enabled` and the configuration is valid, the workspace orchestration policy is active.
+2. `active`: if `state` is `enabled` and the configuration is valid (schema_version 2, or recognized legacy v1), the workspace orchestration policy is active.
 3. `inactive`: if `state` is `draft` or `disabled`, workspace orchestration is inactive. Continue ordinary work normally without delegation enforcement.
 4. `invalid` / `uninitialized`: if `.setting/config.md` or `.setting/boss-orchestrator.md` is missing, or validation fails, treat orchestration as inactive. Tell the user validation failed, quote the reason, and run ordinary work yourself without the boss contract. Never repair the config or rewrite the runtime policy at startup.
 
@@ -48,34 +48,51 @@ The boss:
 
 **Delegation unavailable** (no tool, provider down, every worker disabled): say what is missing and stop before mutating the workspace for that task. Do not edit yourself, substitute a model, or route to the builtin unless the config allows exactly that.
 
-## Workers
+## Workers and ordered routing policy
 
 Workers come only from `workers[]` in `.setting/config.md`. An entry is eligible when `enabled` is true and its exact `provider_instance_id`, `driver_kind`, `route_id`, and `options` still resolve in this environment. Entries disabled by the config show their reason and stay disabled until the user re-decides; a disabled entry is never matched to a similarly named model.
 
 Selection and execution:
 
-- **Equal priority (`boss.priority: equal`).** Boss-owned workers and ordinary workers start with the same priority. The boss chooses per task from the eligible set the user declared; the list is not a ranking and is not round-robin.
-- **Parallel scopes only (`boss.parallel_scopes: disjoint_only`).** Run several workers at once only on disjoint file/directory scopes, one writer per scope. Integration and merges are worker tasks too.
-- **Scopes stay put.** A worker edits only the paths in its brief and inside this workspace. Treat symlinks, junctions, other checkouts, and worktrees as separate scopes.
-- **Retry safety.** Stop the previous task and inspect its leftovers (files, partial writes, remote effects) before any retry. An external non-idempotent action whose outcome is unknown (push, publish, label create, send, deploy) is never retried automatically, neither on the same worker nor on a new one; a cancellation that is not confirmed is not proof the action did not happen.
-- **Capabilities.** Use only the delegation, tracking, and cancellation features this harness actually exposes in this session. When a required feature is missing, report it.
-- **Why the pick.** State the chosen worker and the reason in one line. Prefer a route whose evidence better fits the task; an `unknown` upstream means independence is unknown even when the route was execution-verified.
-- **Thinking/options.** Use only the explicit options recorded for that route (`thinking.option_key`, `thinking.selected`, `thinking.allowed_values`). Do not map a thinking value across models or invent a default that the catalog did not show. Default thinking is disallowed for enabled workers.
-- **Routing.** Follow the delegation routing your harness describes for the current context (native subagent versus a delegation tool, worktree isolation, no shell-made worktrees). Re-check required settings before each route, not once per session.
-- **Recursive delegation (`boss.recursive_delegation: task_explicit_only`).** A worker does its own task and delegates nothing unless its task explicitly allowed the narrower exception and higher instructions permit it. A worker whose task needs a full workflow that itself spawns subagents should have been split by the boss into leaf tasks. If that split is not possible, stop and explain instead of looping.
-- **Fresh reviews.** Every review or re-check is a new delegated task with the brief, acceptance, baseline/head, prior findings, responses, and open objections; do not reuse the previous task to ask for a re-review.
+- **Single source of order (`boss.priority: provider_order`).** Exactly one route may be enabled per `provider_instance_id`. Distinct connection instances (e.g. `antigravity` vs `antigravity_2`) are independent entries. The sequence of enabled entries in `workers[]` defines priority order: the first enabled entry is Priority 1 (highest priority), followed by Priority 2, etc. There are no competing fallback arrays.
+- **Static route config vs. dynamic multi-instance execution.** The static limit of one enabled route per provider configures routing, not execution concurrency. The boss can summon multiple concurrent task execution instances using the same selected model and options as needed, within harness and provider capacity limits. Each task instance receives a unique `taskId` and `clientRequestId`.
+- **Primary provider dispatch & queueing.** Use Priority 1 for all new task dispatches while it is eligible and capacity is available. If Priority 1 capacity is known full, **QUEUE** the task. Do not spill over to Priority 2 solely for speed.
+- **Parallel scopes only (`boss.parallel_scopes: disjoint_only`).** Run multiple workers at once only on disjoint file/directory scopes, one writer per scope. Integration and merges are worker tasks too.
+- **Scopes stay put.** A worker edits only the paths in its brief and inside this workspace. Treat symlinks, junctions, other checkouts, and worktrees as separate scopes. Do not copy unrelated private paths across worktree boundaries.
+- **Operational failures & advance.** On operational error (authentication, quota exhaustion, connection loss, service error, or timeout), immediately stop dispatching on the affected provider and advance to the next eligible priority. Do not automatically retry on the affected provider before the recovery gate.
+- **Task settlement & retry safety.** Verify that the prior task actually stopped before proceeding. Healthy in-flight tasks on other providers do not need to be blindly cancelled; settle their state and avoid writer conflicts. Any failure or timeout with unknown external effects (e.g. push, publish, remote create) must not be repeated automatically.
+- **Structured handoff.** When handing off to the next worker, supply a complete handoff brief:
+  1. Goal and acceptance criteria;
+  2. Modified files or commit/diff reference;
+  3. Completed and partial steps;
+  4. Test evidence from the last verified revision;
+  5. Outstanding errors;
+  6. Cancellation status or uncertain side effects;
+  7. Exact next action.
+  Preserve actual filesystem partial work; do not dump secrets or raw transcripts; do not restart from scratch by default—inspect before resuming.
+- **Thinking and options.** Use only explicit options recorded for that route (`thinking.option_key`, `thinking.selected`, `thinking.allowed_values`). Do not map thinking values across models or invent defaults not shown in the catalog. Default thinking is disallowed for enabled workers.
+- **Recursive delegation (`boss.recursive_delegation: task_explicit_only`).** A worker does its own task and delegates nothing unless its task explicitly allowed the narrower exception and higher instructions permit it.
+- **Fresh reviews.** Every review or re-check is a new delegated task with the brief, acceptance, baseline/head, prior findings, responses, and open objections.
 - **Completion wake.** When the harness says an ended turn will wake on completion, end the turn and wait. Do not poll status, sleep, or schedule wake-ups.
-- **No approvals.** Never auto-approve privileged actions. Parent approval rights do not come from a pending-approval field.
 
-## Reliability: session-only, no scores
+## Reliability: session-only, no persistent scores
 
-There is no stored worker score, reputation, or history file (`boss.reliability_memory: session`). Each session starts from the config and the evidence labels. The boss learns only within the session through feedback and decisions.
+There is no stored worker score, reputation, or history file (`boss.reliability_memory: session`). Each session starts from the config and evidence labels. The boss tracks routing state only in-memory within the active session.
 
 **Quality first (`boss.quality_feedback: first`).** Judge output against acceptance criteria. Give concrete quality feedback before considering whether the route is the problem.
 
-**No-progress rule (`boss.no_progress_rounds: 2`, `boss.after_change: escalate`).** After 2 consecutive correction rounds with no measurable progress against acceptance criteria, change the worker or the approach. If the same blockage persists after that change, escalate to the user as not accepted, with the evidence, the cause, and the one decision needed. A round where the failure is deterministic and repeated is progress-none, even if the worker produced a new answer.
+**No-progress rule (`boss.no_progress_rounds: 2`, `boss.after_change: escalate`).** After 2 consecutive correction rounds with no measurable progress against acceptance criteria, mark the provider unsatisfactory for this task/approach and switch to the next eligible provider. If all configured providers are exhausted or no eligible safe work remains, escalate to the user as not accepted (`boss.after_change: escalate`), reporting evidence, cause, and the single decision needed. Never fall back to the parent or builtin model.
 
-**Fallback (`boss.fallback_workers`).** Operational fallback (switching routes after a failure) is allowed only among eligible entries listed in `boss.fallback_workers` (an unordered allowlist of worker IDs, with all workers having equal initial priority; the list defines allowed candidates, not a forced sequence or ranking). Quality feedback first: a healthy route with unclear acceptance criteria is a brief problem, not a fallback case.
+**Recovery trial after 5 accepted lower-priority tasks (`boss.retry_after_successful_tasks: 5`).**
+- When a higher-priority provider has failed (operationally or via quality exhaustion), it is temporarily bypassed.
+- After **FIVE SUCCESSFULLY COMPLETED** worker tasks on lower-priority provider(s) since that provider's last failure, the boss may retry **ONE real task** on the higher-priority provider (never a synthetic paid probe).
+- Tasks are counted **once per unique task ID only after the parent explicitly accepts the evidence**. Incomplete tasks, cancelled tasks, retries, model turns, or run completions where quality was not accepted do NOT count towards the threshold.
+- For multiple failed priority levels, track lower-provider successes for each failed provider; retry the highest eligible failed priority first.
+- Exactly one recovery trial per provider at a time (no flooding). While a trial is pending, valid existing lower-priority tasks may continue on disjoint scopes without competing writes; do not launch a second trial.
+- **Trial outcome:**
+  - If the recovery trial succeeds and is accepted: the provider is restored to healthy, and new dispatches return to the highest priority.
+  - If the trial fails (operational error, timeout, or rejected quality): remain on the lower-priority provider, reset that provider's success counter to 0, and require 5 new accepted completions before attempting another trial.
+- **New session reset:** Starting a new session resets all failure memory and begins at configured Priority 1.
 
 ## Evidence and provenance
 
@@ -88,7 +105,7 @@ Keep four kinds of knowledge apart, per claim:
 | `execution_verified` | a disposable task run that passed | This route ran this task in this environment |
 | `unknown` | upstreams, pool composition, weights | Nothing — record it as unknown |
 
-Catalog presence is not authentication or a successful run; a run does not prove the underlying weights, the upstream, or that two routes are independent. Route IDs and prefixes are opaque. When an entry declares an `unknown` upstream mapping, say that independence is unknown. Re-check when a route ID, option, provider instance, harness version, or config changes: mark old evidence stale instead of silently reusing it. Execution evidence and timestamps live in `workers[].execution_evidence`, never in this file.
+Catalog presence is not authentication or a successful run; a run does not prove the underlying weights, the upstream, or that two routes are independent. When an entry declares an `unknown` upstream mapping, say that independence is unknown. Re-check when a route ID, option, provider instance, harness version, or config changes: mark old evidence stale instead of silently reusing it.
 
 ## Threads and continuity
 
@@ -102,4 +119,4 @@ User text outside the managed marker block stays as written. The Matt Pocock `##
 
 ## Limitations
 
-This policy binds only through instructions. The boss is told to delegate every substantive mutation, but nothing at the tool layer stops a determined write; treat "guaranteed parent-immutable" as unproven. Hooks and tool routers vary by harness; this file assumes none. Which files an agent actually loads differs per harness (for example a Codex-style `AGENTS.md` chain versus another product's memory file), so verify that the pointer is in the file your harness reads before relying on this policy.
+This policy binds only through instructions. The boss is told to delegate every substantive mutation, but nothing at the tool layer stops a determined write; treat "guaranteed parent-immutable" as unproven. Hooks and tool routers vary by harness; this file assumes none.

@@ -1,11 +1,13 @@
-# boss-orchestrator workspace config (sample template)
+# boss-orchestrator workspace config (sample template v2)
 
 Read by `.setting/boss-orchestrator.md`. The single fenced `json` block below is the only
 machine-read part of this file; `null` means unresolved, never wildcard or permission.
+In schema_version 2, the order of enabled entries in `workers[]` defines provider priority
+(first enabled worker = highest priority). Exactly one enabled route is allowed per provider instance.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "state": "draft",
   "scope": {
     "kind": "workspace",
@@ -24,12 +26,12 @@ machine-read part of this file; `null` means unresolved, never wildcard or permi
   "workers": [
     {
       "id": "sample-worker-1",
-      "label": "Sample Worker 1",
+      "label": "Sample Worker 1 (Priority 1)",
       "enabled": true,
       "disabled_reason": null,
-      "provider_instance_id": "sample_provider_id",
+      "provider_instance_id": "sample_provider_1",
       "driver_kind": "sample_driver",
-      "route_id": "vendor/sample-model",
+      "route_id": "vendor/sample-model-1",
       "options": {
         "thinking_level": "high"
       },
@@ -44,7 +46,43 @@ machine-read part of this file; `null` means unresolved, never wildcard or permi
         ]
       },
       "model_claim": {
-        "name": "Sample Model Claim",
+        "name": "Sample Model 1",
+        "provenance": "user_declared"
+      },
+      "upstreams": {
+        "mapping": null,
+        "independence": "unknown"
+      },
+      "catalog_evidence": {
+        "level": "catalog_verified",
+        "source_ref": "declared_catalog",
+        "observed_at": "2026-11-06"
+      },
+      "execution_evidence": null
+    },
+    {
+      "id": "sample-worker-2",
+      "label": "Sample Worker 2 (Priority 2)",
+      "enabled": true,
+      "disabled_reason": null,
+      "provider_instance_id": "sample_provider_2",
+      "driver_kind": "sample_driver",
+      "route_id": "vendor/sample-model-2",
+      "options": {
+        "thinking_level": "high"
+      },
+      "thinking": {
+        "mode": "explicit",
+        "option_key": "thinking_level",
+        "selected": "high",
+        "allowed_values": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "model_claim": {
+        "name": "Sample Model 2",
         "provenance": "user_declared"
       },
       "upstreams": {
@@ -60,10 +98,10 @@ machine-read part of this file; `null` means unresolved, never wildcard or permi
     },
     {
       "id": "sample-worker-unresolved",
-      "label": "Sample Unresolved Worker",
+      "label": "Sample Inactive Alternative Route",
       "enabled": false,
-      "disabled_reason": "unresolved exact catalog route",
-      "provider_instance_id": "sample_provider_id",
+      "disabled_reason": "inactive provider route alternative",
+      "provider_instance_id": "sample_provider_1",
       "driver_kind": "sample_driver",
       "route_id": "vendor/unresolved-model",
       "options": null,
@@ -88,15 +126,13 @@ machine-read part of this file; `null` means unresolved, never wildcard or permi
     "review_exception": "small_clear_local_review_fixes",
     "recursive_delegation": "task_explicit_only",
     "builtin_fallback": "excluded",
-    "priority": "equal",
+    "priority": "provider_order",
     "reliability_memory": "session",
     "parallel_scopes": "disjoint_only",
     "quality_feedback": "first",
     "no_progress_rounds": 2,
     "after_change": "escalate",
-    "fallback_workers": [
-      "sample-worker-1"
-    ]
+    "retry_after_successful_tasks": 5
   },
   "confirmation": null
 }

@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-"""Deterministic stdlib helper for boss-orchestrator-init skill."""
+"""Deterministic stdlib helper for boss-orchestrator-init skill.
+
+Supports schema_version 1 (legacy equal-priority) and schema_version 2 (ordered-provider policy).
+Includes pure session routing verification and reference state machine for runtime dispatch and recovery.
+Live routing during task execution is instruction-governed by the top-level orchestrator agent
+without runtime harness middleware or hooks.
+"""
 from __future__ import annotations
 import argparse, difflib, hashlib, json, os, re, sys
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-TOOL_VERSION, SCHEMA_VERSION = "1", 1
+TOOL_VERSION = "2"
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 MARKER_BEGIN = "<!-- boss-orchestrator-init:begin v1 -->"
 MARKER_END = "<!-- boss-orchestrator-init:end v1 -->"
 MANAGED_FILES = ("AGENTS.md", ".setting/config.md", ".setting/boss-orchestrator.md")
@@ -153,14 +162,8 @@ def _validate_evidence(ev: Any, expected_level: str, path: str, errs: list[str])
         errs.append(f"{path}.observed_at must be valid YYYY-MM-DD date string")
 
 
-def validate_config(cfg: dict[str, Any], root: Path | None = None) -> list[str]:
-    errs: list[str] = []
-    if not isinstance(cfg, dict):
-        return ["Config root must be a JSON object"]
-
+def _validate_shared_config(cfg: dict[str, Any], root: Path | None, errs: list[str]) -> None:
     _check_keys(cfg, {"schema_version", "state", "scope", "harness", "parent", "workers", "boss", "confirmation"}, "root", errs)
-    if cfg.get("schema_version") != SCHEMA_VERSION or isinstance(cfg.get("schema_version"), bool):
-        errs.append(f"schema_version must be {SCHEMA_VERSION}")
     if cfg.get("state") not in ("draft", "enabled", "disabled"):
         errs.append("state must be draft, enabled, or disabled")
 
@@ -199,163 +202,210 @@ def validate_config(cfg: dict[str, Any], root: Path | None = None) -> list[str]:
         if parent.get("selection") != "current_active":
             errs.append("parent.selection must be 'current_active'")
 
-    # Workers validation
-    workers = cfg.get("workers")
+    # Confirmation validation
+    conf = cfg.get("confirmation")
+    if cfg.get("state") == "enabled":
+        if not isinstance(conf, dict):
+            errs.append("confirmation must be an object when state is enabled")
+        else:
+            _check_keys(conf, {"approved_at"}, "confirmation", errs)
+            if not _is_date(conf.get("approved_at")):
+                errs.append("confirmation.approved_at valid YYYY-MM-DD date required when state is enabled")
+    elif conf is not None:
+        if not isinstance(conf, dict):
+            errs.append("confirmation must be null or an object")
+        else:
+            _check_keys(conf, {"approved_at"}, "confirmation", errs)
+            if not _is_date(conf.get("approved_at")):
+                errs.append("confirmation.approved_at must be valid YYYY-MM-DD date")
+
+
+def _validate_workers_common(
+    workers: Any, cfg: dict[str, Any], errs: list[str], enforce_one_enabled_per_provider: bool
+) -> set[str]:
     enabled_ids: set[str] = set()
     if not isinstance(workers, list) or not workers:
         errs.append("workers must be non-empty list")
-    else:
-        seen_ids: set[str] = set()
-        seen_routes: set[tuple[str, str, str]] = set()
-        for idx, w in enumerate(workers):
-            p = f"workers[{idx}]"
-            if not isinstance(w, dict):
-                errs.append(f"{p}: must be an object")
-                continue
-            _check_keys(
-                w,
-                {"id", "label", "enabled", "disabled_reason", "provider_instance_id", "driver_kind", "route_id", "options", "thinking", "model_claim", "upstreams", "catalog_evidence", "execution_evidence"},
-                p,
-                errs,
-            )
-            wid = w.get("id")
-            if not isinstance(wid, str) or not ID_RE.match(wid):
-                errs.append(f"{p}.id must match {ID_RE.pattern}")
-            elif wid in seen_ids:
-                errs.append(f"{p}.id duplicate worker id {wid!r}")
+        return enabled_ids
+
+    seen_ids: set[str] = set()
+    seen_routes: set[tuple[str, str, str]] = set()
+    seen_enabled_providers: set[str] = set()
+
+    for idx, w in enumerate(workers):
+        p = f"workers[{idx}]"
+        if not isinstance(w, dict):
+            errs.append(f"{p}: must be an object")
+            continue
+        _check_keys(
+            w,
+            {
+                "id", "label", "enabled", "disabled_reason", "provider_instance_id", "driver_kind",
+                "route_id", "options", "thinking", "model_claim", "upstreams", "catalog_evidence",
+                "execution_evidence"
+            },
+            p,
+            errs,
+        )
+        wid = w.get("id")
+        if not isinstance(wid, str) or not ID_RE.match(wid):
+            errs.append(f"{p}.id must match {ID_RE.pattern}")
+        elif wid in seen_ids:
+            errs.append(f"{p}.id duplicate worker id {wid!r}")
+        else:
+            seen_ids.add(wid)
+
+        if not isinstance(w.get("label"), str) or not w["label"].strip():
+            errs.append(f"{p}.label must be non-empty string")
+
+        pid = w.get("provider_instance_id")
+        dk = w.get("driver_kind")
+        rid = w.get("route_id")
+
+        if not isinstance(pid, str) or not pid.strip():
+            errs.append(f"{p}.provider_instance_id must be non-empty string")
+        if not isinstance(dk, str) or not dk.strip():
+            errs.append(f"{p}.driver_kind must be non-empty string")
+        if not isinstance(rid, str) or not rid.strip():
+            errs.append(f"{p}.route_id must be non-empty string")
+
+        if isinstance(pid, str) and isinstance(dk, str) and isinstance(rid, str):
+            route = (pid, dk, rid)
+            if route in seen_routes:
+                errs.append(f"{p}: duplicate route {route!r}")
             else:
-                seen_ids.add(wid)
+                seen_routes.add(route)
 
-            if not isinstance(w.get("label"), str) or not w["label"].strip():
-                errs.append(f"{p}.label must be non-empty string")
-
-            pid = w.get("provider_instance_id")
-            dk = w.get("driver_kind")
-            rid = w.get("route_id")
-
-            if not isinstance(pid, str) or not pid.strip():
-                errs.append(f"{p}.provider_instance_id must be non-empty string")
-            if not isinstance(dk, str) or not dk.strip():
-                errs.append(f"{p}.driver_kind must be non-empty string")
-            if not isinstance(rid, str) or not rid.strip():
-                errs.append(f"{p}.route_id must be non-empty string")
-
-            if isinstance(pid, str) and isinstance(dk, str) and isinstance(rid, str):
-                route = (pid, dk, rid)
-                if route in seen_routes:
-                    errs.append(f"{p}: duplicate route {route!r}")
+        en = w.get("enabled")
+        if not isinstance(en, bool):
+            errs.append(f"{p}.enabled must be boolean")
+        elif en:
+            if isinstance(wid, str) and ID_RE.match(wid):
+                enabled_ids.add(wid)
+            if enforce_one_enabled_per_provider and isinstance(pid, str):
+                if pid in seen_enabled_providers:
+                    errs.append(f"{p}: provider_instance_id {pid!r} already has an enabled worker route")
                 else:
-                    seen_routes.add(route)
+                    seen_enabled_providers.add(pid)
 
-            en = w.get("enabled")
-            if not isinstance(en, bool):
-                errs.append(f"{p}.enabled must be boolean")
-            elif en:
-                if isinstance(wid, str) and ID_RE.match(wid):
-                    enabled_ids.add(wid)
-                if w.get("disabled_reason") is not None:
-                    errs.append(f"{p}.disabled_reason must be null when enabled")
-                if not isinstance(w.get("options"), dict) or not w["options"]:
-                    errs.append(f"{p}.options must be non-empty dict when enabled")
-                if w.get("catalog_evidence") is None:
-                    errs.append(f"{p}.catalog_evidence required for enabled worker")
+            if w.get("disabled_reason") is not None:
+                errs.append(f"{p}.disabled_reason must be null when enabled")
+            if not isinstance(w.get("options"), dict) or not w["options"]:
+                errs.append(f"{p}.options must be non-empty dict when enabled")
+            if w.get("catalog_evidence") is None:
+                errs.append(f"{p}.catalog_evidence required for enabled worker")
+            else:
+                _validate_evidence(w.get("catalog_evidence"), "catalog_verified", f"{p}.catalog_evidence", errs)
+            if cfg.get("state") == "enabled":
+                if w.get("execution_evidence") is None:
+                    errs.append(f"{p}.execution_evidence required when state is enabled")
                 else:
-                    _validate_evidence(w.get("catalog_evidence"), "catalog_verified", f"{p}.catalog_evidence", errs)
-                if cfg.get("state") == "enabled":
-                    if w.get("execution_evidence") is None:
-                        errs.append(f"{p}.execution_evidence required when state is enabled")
-                    else:
-                        _validate_evidence(w.get("execution_evidence"), "execution_verified", f"{p}.execution_evidence", errs)
-                elif w.get("execution_evidence") is not None:
                     _validate_evidence(w.get("execution_evidence"), "execution_verified", f"{p}.execution_evidence", errs)
-            else:
-                if not isinstance(w.get("disabled_reason"), str) or not w["disabled_reason"].strip():
-                    errs.append(f"{p}.disabled_reason required when disabled")
-                if w.get("execution_evidence") is not None:
-                    errs.append(f"{p}.execution_evidence must be null when disabled")
-                if w.get("catalog_evidence") is not None:
-                    _validate_evidence(w.get("catalog_evidence"), "catalog_verified", f"{p}.catalog_evidence", errs)
+            elif w.get("execution_evidence") is not None:
+                _validate_evidence(w.get("execution_evidence"), "execution_verified", f"{p}.execution_evidence", errs)
+        else:
+            if not isinstance(w.get("disabled_reason"), str) or not w["disabled_reason"].strip():
+                errs.append(f"{p}.disabled_reason required when disabled")
+            if w.get("execution_evidence") is not None:
+                errs.append(f"{p}.execution_evidence must be null when disabled")
+            if w.get("catalog_evidence") is not None:
+                _validate_evidence(w.get("catalog_evidence"), "catalog_verified", f"{p}.catalog_evidence", errs)
 
-            # Thinking validation
-            th = w.get("thinking")
-            if en is True:
+        # Thinking validation
+        th = w.get("thinking")
+        if en is True:
+            if not isinstance(th, dict):
+                errs.append(f"{p}.thinking must be an object for enabled worker")
+            else:
+                for k in sorted(set(th) - {"mode", "option_key", "selected", "allowed_values", "reason"}):
+                    errs.append(f"{p}.thinking: unknown key {k!r}")
+                mode = th.get("mode")
+                if mode == "default":
+                    errs.append(f"{p}.thinking mode 'default' is not allowed for enabled worker")
+                elif mode == "disabled":
+                    if "reason" not in th or not isinstance(th.get("reason"), str) or not th["reason"].strip():
+                        errs.append(f"{p}.thinking disabled requires non-empty reason")
+                    for extra in ("option_key", "selected", "allowed_values"):
+                        if extra in th:
+                            errs.append(f"{p}.thinking disabled should not have {extra}")
+                elif mode == "explicit":
+                    for req in ("option_key", "selected", "allowed_values"):
+                        if req not in th:
+                            errs.append(f"{p}.thinking: missing key {req!r}")
+                    if "reason" in th:
+                        errs.append(f"{p}.thinking explicit should not have reason")
+                    opt_key = th.get("option_key")
+                    sel = th.get("selected")
+                    allowed = th.get("allowed_values")
+                    if opt_key is not None and (not isinstance(opt_key, str) or not opt_key.strip()):
+                        errs.append(f"{p}.thinking explicit requires non-empty option_key")
+                    if sel is not None and (not isinstance(sel, str) or not sel.strip()):
+                        errs.append(f"{p}.thinking explicit requires non-empty selected")
+                    if allowed is not None:
+                        if not isinstance(allowed, list) or not allowed or any(not isinstance(x, str) for x in allowed):
+                            errs.append(f"{p}.thinking explicit requires non-empty list of string allowed_values")
+                        elif sel not in allowed:
+                            errs.append(f"{p}.thinking selected {sel!r} not in allowed_values {allowed!r}")
+
+                    opts = w.get("options")
+                    if isinstance(opts, dict) and isinstance(opt_key, str) and isinstance(sel, str):
+                        if opt_key not in opts:
+                            errs.append(f"{p}.options missing thinking option_key {opt_key!r}")
+                        elif opts[opt_key] != sel:
+                            errs.append(f"{p}.options[{opt_key!r}] ({opts[opt_key]!r}) does not match thinking.selected ({sel!r})")
+                else:
+                    errs.append(f"{p}.thinking mode must be 'explicit' or 'disabled'")
+        else:
+            if th is not None:
                 if not isinstance(th, dict):
-                    errs.append(f"{p}.thinking must be an object for enabled worker")
+                    errs.append(f"{p}.thinking must be an object or null")
                 else:
                     for k in sorted(set(th) - {"mode", "option_key", "selected", "allowed_values", "reason"}):
                         errs.append(f"{p}.thinking: unknown key {k!r}")
-                    mode = th.get("mode")
-                    if mode == "default":
-                        errs.append(f"{p}.thinking mode 'default' is not allowed for enabled worker")
-                    elif mode == "disabled":
-                        if "reason" not in th or not isinstance(th.get("reason"), str) or not th["reason"].strip():
-                            errs.append(f"{p}.thinking disabled requires non-empty reason")
-                        for extra in ("option_key", "selected", "allowed_values"):
-                            if extra in th:
-                                errs.append(f"{p}.thinking disabled should not have {extra}")
-                    elif mode == "explicit":
-                        for req in ("option_key", "selected", "allowed_values"):
-                            if req not in th:
-                                errs.append(f"{p}.thinking: missing key {req!r}")
-                        if "reason" in th:
-                            errs.append(f"{p}.thinking explicit should not have reason")
-                        opt_key = th.get("option_key")
-                        sel = th.get("selected")
-                        allowed = th.get("allowed_values")
-                        if opt_key is not None and (not isinstance(opt_key, str) or not opt_key.strip()):
-                            errs.append(f"{p}.thinking explicit requires non-empty option_key")
-                        if sel is not None and (not isinstance(sel, str) or not sel.strip()):
-                            errs.append(f"{p}.thinking explicit requires non-empty selected")
-                        if allowed is not None:
-                            if not isinstance(allowed, list) or not allowed or any(not isinstance(x, str) for x in allowed):
-                                errs.append(f"{p}.thinking explicit requires non-empty list of string allowed_values")
-                            elif sel not in allowed:
-                                errs.append(f"{p}.thinking selected {sel!r} not in allowed_values {allowed!r}")
+                    if th.get("mode") not in ("default", "explicit", "disabled"):
+                        errs.append(f"{p}.thinking mode must be default, explicit, or disabled")
+                    elif th.get("mode") == "disabled" and ("reason" not in th or not isinstance(th.get("reason"), str) or not th["reason"].strip()):
+                        errs.append(f"{p}.thinking disabled requires reason")
 
-                        opts = w.get("options")
-                        if isinstance(opts, dict) and isinstance(opt_key, str) and isinstance(sel, str):
-                            if opt_key not in opts:
-                                errs.append(f"{p}.options missing thinking option_key {opt_key!r}")
-                            elif opts[opt_key] != sel:
-                                errs.append(f"{p}.options[{opt_key!r}] ({opts[opt_key]!r}) does not match thinking.selected ({sel!r})")
-                    else:
-                        errs.append(f"{p}.thinking mode must be 'explicit' or 'disabled'")
-            else:
-                if th is not None:
-                    if not isinstance(th, dict):
-                        errs.append(f"{p}.thinking must be an object or null")
-                    else:
-                        for k in sorted(set(th) - {"mode", "option_key", "selected", "allowed_values", "reason"}):
-                            errs.append(f"{p}.thinking: unknown key {k!r}")
-                        if th.get("mode") not in ("default", "explicit", "disabled"):
-                            errs.append(f"{p}.thinking mode must be default, explicit, or disabled")
-                        elif th.get("mode") == "disabled" and ("reason" not in th or not isinstance(th.get("reason"), str) or not th["reason"].strip()):
-                            errs.append(f"{p}.thinking disabled requires reason")
+        # Model claim validation
+        claim = w.get("model_claim")
+        if not isinstance(claim, dict):
+            errs.append(f"{p}.model_claim must be an object")
+        else:
+            _check_keys(claim, {"name", "provenance"}, f"{p}.model_claim", errs)
+            if not isinstance(claim.get("name"), str) or not claim["name"].strip():
+                errs.append(f"{p}.model_claim.name must be non-empty string")
+            if claim.get("provenance") != "user_declared":
+                errs.append(f"{p}.model_claim.provenance must be 'user_declared'")
 
-            # Model claim validation
-            claim = w.get("model_claim")
-            if not isinstance(claim, dict):
-                errs.append(f"{p}.model_claim must be an object")
-            else:
-                _check_keys(claim, {"name", "provenance"}, f"{p}.model_claim", errs)
-                if not isinstance(claim.get("name"), str) or not claim["name"].strip():
-                    errs.append(f"{p}.model_claim.name must be non-empty string")
-                if claim.get("provenance") != "user_declared":
-                    errs.append(f"{p}.model_claim.provenance must be 'user_declared'")
-
-            # Upstreams validation
-            up = w.get("upstreams")
-            if not isinstance(up, dict):
-                errs.append(f"{p}.upstreams must be an object")
-            else:
-                _check_keys(up, {"mapping", "independence"}, f"{p}.upstreams", errs)
-                if up.get("independence") not in ("unknown", "declared_independent", "declared_shared"):
-                    errs.append(f"{p}.upstreams.independence must be 'unknown', 'declared_independent', or 'declared_shared'")
+        # Upstreams validation
+        up = w.get("upstreams")
+        if not isinstance(up, dict):
+            errs.append(f"{p}.upstreams must be an object")
+        else:
+            _check_keys(up, {"mapping", "independence"}, f"{p}.upstreams", errs)
+            if up.get("independence") not in ("unknown", "declared_independent", "declared_shared"):
+                errs.append(f"{p}.upstreams.independence must be 'unknown', 'declared_independent', or 'declared_shared'")
 
     if cfg.get("state") == "enabled" and not enabled_ids:
         errs.append("state 'enabled' requires at least 1 enabled worker")
 
-    # Boss block validation
+    return enabled_ids
+
+
+def validate_config_v1(cfg: dict[str, Any], root: Path | None = None) -> list[str]:
+    """Validate legacy schema_version 1 configuration."""
+    errs: list[str] = []
+    if not isinstance(cfg, dict):
+        return ["Config root must be a JSON object"]
+
+    ver = cfg.get("schema_version")
+    if type(ver) is not int or isinstance(ver, bool) or ver != 1:
+        errs.append("schema_version must be integer 1")
+
+    _validate_shared_config(cfg, root, errs)
+    enabled_ids = _validate_workers_common(cfg.get("workers"), cfg, errs, enforce_one_enabled_per_provider=False)
+
     boss = cfg.get("boss")
     if not isinstance(boss, dict):
         errs.append("boss must be an object")
@@ -363,17 +413,9 @@ def validate_config(cfg: dict[str, Any], root: Path | None = None) -> list[str]:
         _check_keys(
             boss,
             {
-                "selection",
-                "review_exception",
-                "recursive_delegation",
-                "builtin_fallback",
-                "fallback_workers",
-                "priority",
-                "reliability_memory",
-                "parallel_scopes",
-                "quality_feedback",
-                "no_progress_rounds",
-                "after_change",
+                "selection", "review_exception", "recursive_delegation", "builtin_fallback",
+                "fallback_workers", "priority", "reliability_memory", "parallel_scopes",
+                "quality_feedback", "no_progress_rounds", "after_change"
             },
             "boss",
             errs,
@@ -416,25 +458,423 @@ def validate_config(cfg: dict[str, Any], root: Path | None = None) -> list[str]:
                 else:
                     seen_fb.add(x)
 
-    # Confirmation validation
-    conf = cfg.get("confirmation")
-    if cfg.get("state") == "enabled":
-        if not isinstance(conf, dict):
-            errs.append("confirmation must be an object when state is enabled")
-        else:
-            _check_keys(conf, {"approved_at"}, "confirmation", errs)
-            if not _is_date(conf.get("approved_at")):
-                errs.append("confirmation.approved_at valid YYYY-MM-DD date required when state is enabled")
-    elif conf is not None:
-        if not isinstance(conf, dict):
-            errs.append("confirmation must be null or an object")
-        else:
-            _check_keys(conf, {"approved_at"}, "confirmation", errs)
-            if not _is_date(conf.get("approved_at")):
-                errs.append("confirmation.approved_at must be valid YYYY-MM-DD date")
+    return errs
+
+
+def validate_config_v2(cfg: dict[str, Any], root: Path | None = None) -> list[str]:
+    """Validate current schema_version 2 configuration."""
+    errs: list[str] = []
+    if not isinstance(cfg, dict):
+        return ["Config root must be a JSON object"]
+
+    ver = cfg.get("schema_version")
+    if type(ver) is not int or isinstance(ver, bool) or ver != 2:
+        errs.append("schema_version must be integer 2")
+
+    _validate_shared_config(cfg, root, errs)
+    enabled_ids = _validate_workers_common(cfg.get("workers"), cfg, errs, enforce_one_enabled_per_provider=True)
+
+    boss = cfg.get("boss")
+    if not isinstance(boss, dict):
+        errs.append("boss must be an object")
+    else:
+        # fallback_workers is redundant in v2 (workers order is the single source of truth).
+        # We permit either omitting it or including a list that strictly matches enabled worker IDs in priority order.
+        allowed_boss_keys = {
+            "selection", "review_exception", "recursive_delegation", "builtin_fallback",
+            "priority", "reliability_memory", "parallel_scopes", "quality_feedback",
+            "no_progress_rounds", "after_change", "retry_after_successful_tasks"
+        }
+        if "fallback_workers" in boss:
+            allowed_boss_keys.add("fallback_workers")
+
+        _check_keys(boss, allowed_boss_keys, "boss", errs)
+
+        if boss.get("selection") != "boss_per_task":
+            errs.append("boss.selection must be 'boss_per_task'")
+        if boss.get("review_exception") != "small_clear_local_review_fixes":
+            errs.append("boss.review_exception must be 'small_clear_local_review_fixes'")
+        if boss.get("recursive_delegation") != "task_explicit_only":
+            errs.append("boss.recursive_delegation must be 'task_explicit_only'")
+        if boss.get("builtin_fallback") != "excluded":
+            errs.append("boss.builtin_fallback must be 'excluded'")
+        if boss.get("priority") != "provider_order":
+            errs.append("boss.priority must be 'provider_order'")
+        if boss.get("reliability_memory") != "session":
+            errs.append("boss.reliability_memory must be 'session'")
+        if boss.get("parallel_scopes") != "disjoint_only":
+            errs.append("boss.parallel_scopes must be 'disjoint_only'")
+        if boss.get("quality_feedback") != "first":
+            errs.append("boss.quality_feedback must be 'first'")
+        if boss.get("after_change") != "escalate":
+            errs.append("boss.after_change must be 'escalate'")
+
+        npr = boss.get("no_progress_rounds")
+        if not isinstance(npr, int) or isinstance(npr, bool) or npr <= 0:
+            errs.append("boss.no_progress_rounds must be a positive integer")
+
+        rst = boss.get("retry_after_successful_tasks")
+        if not isinstance(rst, int) or isinstance(rst, bool) or rst <= 0:
+            errs.append("boss.retry_after_successful_tasks must be a positive integer")
+
+        if "fallback_workers" in boss:
+            fb = boss.get("fallback_workers")
+            workers = cfg.get("workers", [])
+            ordered_enabled = [w.get("id") for w in workers if isinstance(w, dict) and w.get("enabled")]
+            if not isinstance(fb, list) or fb != ordered_enabled:
+                errs.append("boss.fallback_workers in schema_version 2 is redundant and must strictly match enabled worker IDs in priority order")
 
     return errs
 
+
+def validate_config(cfg: dict[str, Any], root: Path | None = None, expected_version: int | None = None) -> list[str]:
+    """Validate configuration according to its declared schema_version (1 or 2)."""
+    if not isinstance(cfg, dict):
+        return ["Config root must be a JSON object"]
+
+    ver = cfg.get("schema_version")
+    if expected_version is not None:
+        if type(expected_version) is not int or isinstance(expected_version, bool):
+            return [f"expected_version must be integer (1 or 2), got {type(expected_version).__name__}"]
+        if type(ver) is not int or isinstance(ver, bool) or ver != expected_version:
+            return [f"schema_version must be integer {expected_version}"]
+
+    if type(ver) is not int or isinstance(ver, bool):
+        return ["schema_version must be an integer (1 or 2)"]
+    if ver == 1:
+        return validate_config_v1(cfg, root)
+    elif ver == 2:
+        return validate_config_v2(cfg, root)
+    else:
+        return [f"unsupported schema_version {ver!r}; supported versions are 1, 2"]
+
+
+# ==============================================================================
+# Pure Deterministic Session Routing State Machine
+# ==============================================================================
+
+@dataclass
+class HandoffBrief:
+    goal_acceptance: str
+    files_or_diff: str
+    completed_steps: list[str]
+    partial_steps: list[str]
+    test_evidence_revision: str
+    outstanding_errors: list[str]
+    cancellation_uncertain_effects: str
+    exact_next_action: str
+
+    def validate(self) -> list[str]:
+        errs = []
+        if not isinstance(self.goal_acceptance, str) or not self.goal_acceptance.strip():
+            errs.append("goal_acceptance must be non-empty string")
+        if not isinstance(self.files_or_diff, str) or not self.files_or_diff.strip():
+            errs.append("files_or_diff must be non-empty string")
+        if not isinstance(self.completed_steps, list):
+            errs.append("completed_steps must be a list")
+        elif any(not isinstance(x, str) or not x.strip() for x in self.completed_steps):
+            errs.append("completed_steps elements must be non-empty strings")
+        if not isinstance(self.partial_steps, list):
+            errs.append("partial_steps must be a list")
+        elif any(not isinstance(x, str) or not x.strip() for x in self.partial_steps):
+            errs.append("partial_steps elements must be non-empty strings")
+        if not isinstance(self.test_evidence_revision, str) or not self.test_evidence_revision.strip():
+            errs.append("test_evidence_revision must be non-empty string")
+        if not isinstance(self.outstanding_errors, list):
+            errs.append("outstanding_errors must be a list")
+        elif any(not isinstance(x, str) or not x.strip() for x in self.outstanding_errors):
+            errs.append("outstanding_errors elements must be non-empty strings")
+        if not isinstance(self.cancellation_uncertain_effects, str) or not self.cancellation_uncertain_effects.strip():
+            errs.append("cancellation_uncertain_effects must be non-empty string")
+        if not isinstance(self.exact_next_action, str) or not self.exact_next_action.strip():
+            errs.append("exact_next_action must be non-empty string")
+        return errs
+
+
+@dataclass
+class ProviderStatus:
+    worker_id: str
+    provider_instance_id: str
+    priority_rank: int  # 1 = highest priority
+    state: Literal["healthy", "operational_failed", "quality_exhausted"] = "healthy"
+    success_count_since_fail: int = 0
+    active_recovery_trial_task_id: str | None = None
+    last_failure_reason: str | None = None
+
+
+@dataclass
+class RouteDecision:
+    action: Literal["dispatch", "recovery_trial", "queue", "escalate"]
+    worker_id: str | None = None
+    provider_instance_id: str | None = None
+    priority_rank: int | None = None
+    reason: str = ""
+    is_recovery_trial: bool = False
+
+
+class SessionRouter:
+    """Pure in-memory deterministic routing verification and reference module for a boss session.
+
+    NOTE: Live routing during task execution is instruction-governed by the top-level
+    orchestrator agent without runtime harness middleware or hooks. This class serves as an
+    executable reference state machine to verify and simulate routing invariants: ordered
+    priorities, dynamic multi-instance capacity/queueing, operational advance, structured
+    handoffs, per-task 2-round quality escalation, and session-only 5-task recovery trials.
+    """
+
+    def __init__(self, config: dict[str, Any]):
+        errs = validate_config(config)
+        if errs:
+            raise InitError(f"Cannot initialize SessionRouter with invalid config: {'; '.join(errs)}")
+
+        workers = config.get("workers", [])
+        self.ordered_workers = [w for w in workers if isinstance(w, dict) and w.get("enabled") is True]
+        boss = config.get("boss", {})
+        self.no_progress_rounds_threshold: int = int(boss.get("no_progress_rounds", 2))
+        self.retry_after_successful_tasks: int = int(boss.get("retry_after_successful_tasks", 5))
+
+        self.providers: dict[str, ProviderStatus] = {}
+        for rank, w in enumerate(self.ordered_workers, start=1):
+            wid = w["id"]
+            pid = w["provider_instance_id"]
+            self.providers[wid] = ProviderStatus(
+                worker_id=wid,
+                provider_instance_id=pid,
+                priority_rank=rank,
+            )
+
+        self.in_flight_tasks: dict[str, dict[str, Any]] = {}
+        self.terminal_tasks: dict[str, dict[str, Any]] = {}
+        self.accepted_task_ids: set[str] = set()
+        self.consecutive_no_progress: dict[str, int] = {}  # keyed per task_id
+        self.last_handoff: HandoffBrief | None = None
+
+    def get_route_decision(self, capacity_available: bool = True) -> RouteDecision:
+        """Determine next routing action: dispatch, recovery trial, queue, or escalate."""
+        sorted_providers = sorted(self.providers.values(), key=lambda p: p.priority_rank)
+
+        # 1. Check recovery trial eligibility on failed providers in priority order (highest priority first).
+        # Invariant: only one global pending recovery trial across the entire session router.
+        active_trial_exists = any(p.active_recovery_trial_task_id is not None for p in self.providers.values())
+        if not active_trial_exists:
+            for p in sorted_providers:
+                if p.state != "healthy":
+                    if p.success_count_since_fail >= self.retry_after_successful_tasks and p.active_recovery_trial_task_id is None:
+                        if not capacity_available:
+                            return RouteDecision(
+                                action="queue",
+                                worker_id=p.worker_id,
+                                provider_instance_id=p.provider_instance_id,
+                                priority_rank=p.priority_rank,
+                                reason=f"Recovery trial permitted on {p.worker_id} but capacity full; queueing",
+                                is_recovery_trial=True,
+                            )
+                        return RouteDecision(
+                            action="recovery_trial",
+                            worker_id=p.worker_id,
+                            provider_instance_id=p.provider_instance_id,
+                            priority_rank=p.priority_rank,
+                            reason=f"Recovery trial permitted for {p.worker_id} after {p.success_count_since_fail} lower-priority completions",
+                            is_recovery_trial=True,
+                        )
+
+        # 2. Find highest priority healthy provider
+        for p in sorted_providers:
+            if p.state == "healthy":
+                if not capacity_available:
+                    return RouteDecision(
+                        action="queue",
+                        worker_id=p.worker_id,
+                        provider_instance_id=p.provider_instance_id,
+                        priority_rank=p.priority_rank,
+                        reason=f"Priority {p.priority_rank} ({p.worker_id}) capacity full; queueing without spilling",
+                        is_recovery_trial=False,
+                    )
+                return RouteDecision(
+                    action="dispatch",
+                    worker_id=p.worker_id,
+                    provider_instance_id=p.provider_instance_id,
+                    priority_rank=p.priority_rank,
+                    reason=f"Dispatching to eligible priority {p.priority_rank} ({p.worker_id})",
+                    is_recovery_trial=False,
+                )
+
+        # 3. All providers exhausted
+        return RouteDecision(
+            action="escalate",
+            reason="All configured providers exhausted or failed; escalating unaccepted without fallback",
+        )
+
+    def record_task_dispatch(self, task_id: str, worker_id: str, is_recovery_trial: bool = False) -> None:
+        if worker_id not in self.providers:
+            raise InitError(f"Unknown worker_id {worker_id!r}")
+        if task_id in self.in_flight_tasks:
+            raise InitError(f"Task {task_id!r} is already in-flight")
+        if task_id in self.terminal_tasks:
+            raise InitError(f"Task {task_id!r} has already completed; replay rejected")
+
+        if is_recovery_trial:
+            # Enforce only one global pending recovery trial
+            if any(p.active_recovery_trial_task_id is not None for p in self.providers.values()):
+                raise InitError("Only one global recovery trial may be pending or in-flight at a time")
+            p = self.providers[worker_id]
+            if p.state == "healthy":
+                raise InitError(f"Worker {worker_id!r} is healthy; recovery trial not applicable")
+            p.active_recovery_trial_task_id = task_id
+
+        self.in_flight_tasks[task_id] = {
+            "worker_id": worker_id,
+            "is_recovery_trial": is_recovery_trial,
+        }
+
+    def record_operational_error(self, task_id: str, error_reason: str = "operational error", worker_id: str | None = None) -> None:
+        if task_id in self.terminal_tasks:
+            raise InitError(f"Task {task_id!r} has already completed and reached terminal state; replay rejected")
+        if task_id not in self.in_flight_tasks:
+            raise InitError(f"Task {task_id!r} is not in-flight; operational error rejected")
+
+        task_info = self.in_flight_tasks[task_id]
+        dispatched_worker = task_info["worker_id"]
+        if worker_id is not None and worker_id != dispatched_worker:
+            raise InitError(
+                f"Worker mismatch for task {task_id!r}: task was dispatched to {dispatched_worker!r}, "
+                f"operational error reported for {worker_id!r}; rejected before mutation"
+            )
+        worker_id = dispatched_worker
+
+        del self.in_flight_tasks[task_id]
+        self.terminal_tasks[task_id] = {
+            "worker_id": worker_id,
+            "outcome": "operational_error",
+            "parent_accepted": False,
+            "reason": error_reason,
+        }
+
+        p = self.providers[worker_id]
+        p.state = "operational_failed"
+        p.success_count_since_fail = 0
+        p.last_failure_reason = error_reason
+        if p.active_recovery_trial_task_id == task_id:
+            p.active_recovery_trial_task_id = None
+
+    def record_quality_round(self, task_id: str, worker_id: str, measurable_progress: bool) -> None:
+        if worker_id not in self.providers:
+            raise InitError(f"Unknown worker_id {worker_id!r}")
+        if task_id in self.terminal_tasks:
+            raise InitError(f"Task {task_id!r} has already reached terminal state; cannot record quality round")
+        if task_id not in self.in_flight_tasks:
+            raise InitError(f"Task {task_id!r} is not in-flight; cannot record quality round")
+
+        task_info = self.in_flight_tasks[task_id]
+        dispatched_worker = task_info["worker_id"]
+        if worker_id != dispatched_worker:
+            raise InitError(
+                f"Worker mismatch for task {task_id!r}: task was dispatched to {dispatched_worker!r}, "
+                f"quality round reported for {worker_id!r}; rejected before mutation"
+            )
+
+        # Quality rounds are keyed per task
+        if measurable_progress:
+            self.consecutive_no_progress[task_id] = 0
+        else:
+            cur = self.consecutive_no_progress.get(task_id, 0) + 1
+            self.consecutive_no_progress[task_id] = cur
+            if cur >= self.no_progress_rounds_threshold:
+                p = self.providers[worker_id]
+                p.state = "quality_exhausted"
+                p.last_failure_reason = f"{cur} consecutive rounds with no measurable progress on task {task_id}"
+                # Quality exhaustion settles/clears recovery and resets counter
+                p.active_recovery_trial_task_id = None
+                p.success_count_since_fail = 0
+                self.consecutive_no_progress[task_id] = 0
+
+    def record_task_completion(
+        self,
+        task_id: str,
+        worker_id: str,
+        outcome: Literal["success", "operational_error", "cancelled", "incomplete"],
+        parent_accepted: bool = False,
+    ) -> None:
+        # 1. Terminal registry prevents all replay
+        if task_id in self.terminal_tasks:
+            raise InitError(f"Task {task_id!r} has already completed and reached terminal state; replay rejected")
+
+        # 2. Require valid dispatched in-flight identity on completion (unknown task rejected)
+        if task_id not in self.in_flight_tasks:
+            raise InitError(f"Task {task_id!r} is not in-flight (unknown task completion rejected)")
+
+        # 3. Worker mismatch rejected before mutation
+        task_info = self.in_flight_tasks[task_id]
+        dispatched_worker = task_info["worker_id"]
+        if worker_id != dispatched_worker:
+            raise InitError(
+                f"Worker mismatch for task {task_id!r}: task was dispatched to {dispatched_worker!r}, "
+                f"completion reported for {worker_id!r}; rejected before mutation"
+            )
+
+        if outcome == "operational_error":
+            self.record_operational_error(task_id, error_reason="operational error", worker_id=worker_id)
+            return
+
+        is_trial = task_info.get("is_recovery_trial", False)
+
+        # Validated: transition from in-flight to terminal
+        del self.in_flight_tasks[task_id]
+        self.terminal_tasks[task_id] = {
+            "worker_id": worker_id,
+            "outcome": outcome,
+            "parent_accepted": parent_accepted,
+        }
+
+        p = self.providers[worker_id]
+
+        if outcome in ("cancelled", "incomplete") or not parent_accepted:
+            if is_trial and p.active_recovery_trial_task_id == task_id:
+                # Recovery trial did not complete and get accepted: trial failed, reset counter
+                p.active_recovery_trial_task_id = None
+                p.success_count_since_fail = 0
+            return
+
+        # Accepted success
+        self.accepted_task_ids.add(task_id)
+
+        if is_trial and p.active_recovery_trial_task_id == task_id:
+            # Recovery trial passed! Restore provider
+            p.state = "healthy"
+            p.active_recovery_trial_task_id = None
+            p.success_count_since_fail = 0
+            p.last_failure_reason = None
+            return
+
+        # Normal accepted task: increment success_count_since_fail on all HIGHER-priority failed providers
+        for other in self.providers.values():
+            if other.state != "healthy" and other.priority_rank < p.priority_rank:
+                other.success_count_since_fail += 1
+
+    def create_handoff(self, brief: HandoffBrief) -> HandoffBrief:
+        errs = brief.validate()
+        if errs:
+            raise InitError(f"Invalid HandoffBrief: {'; '.join(errs)}")
+        self.last_handoff = brief
+        return brief
+
+    def reset_session(self) -> None:
+        """Reset routing state for a new session without cross-session persistent state."""
+        self.in_flight_tasks.clear()
+        self.terminal_tasks.clear()
+        self.accepted_task_ids.clear()
+        self.consecutive_no_progress.clear()
+        self.last_handoff = None
+        for p in self.providers.values():
+            p.state = "healthy"
+            p.success_count_since_fail = 0
+            p.active_recovery_trial_task_id = None
+            p.last_failure_reason = None
+
+
+# ==============================================================================
+# Rendering and Lifecycle
+# ==============================================================================
 
 def get_runtime_template_bytes() -> bytes:
     base = Path(__file__).resolve().parent.parent
@@ -550,7 +990,18 @@ def make_plan(root: Path, config_content: str) -> dict[str, Any]:
     _check_agents_override(root)
 
     cfg = parse_config_md(config_content)
-    errs = validate_config(cfg, root)
+    ver = cfg.get("schema_version")
+    if type(ver) is not int or isinstance(ver, bool):
+        raise InitError(f"schema_version must be an integer (1 or 2), found {type(ver).__name__}")
+    if ver == 1:
+        raise InitError(
+            "Config has schema_version 1 (legacy). New plans require schema_version 2. "
+            "Please use the migrate command to draft a v2 configuration with one enabled route per provider and ordered priority."
+        )
+    elif ver != 2:
+        raise InitError(f"Unsupported schema_version {ver!r}; expected {SCHEMA_VERSION}")
+
+    errs = validate_config_v2(cfg, root)
     if errs:
         raise InitError(errs)
 
@@ -593,8 +1044,9 @@ def apply_plan(root: Path, plan_data: dict[str, Any], confirmed: bool) -> tuple[
     if not isinstance(plan_data, dict):
         raise InitError("Plan data must be a JSON object")
 
-    if plan_data.get("version") != SCHEMA_VERSION or isinstance(plan_data.get("version"), bool):
-        raise InitError(f"Plan version mismatch: expected {SCHEMA_VERSION}")
+    p_ver = plan_data.get("version")
+    if type(p_ver) is not int or isinstance(p_ver, bool) or p_ver not in SUPPORTED_SCHEMA_VERSIONS:
+        raise InitError(f"Plan version mismatch: expected integer in {SUPPORTED_SCHEMA_VERSIONS}")
 
     plan_root = Path(plan_data.get("root", "")).resolve()
     if root != plan_root:
@@ -604,7 +1056,7 @@ def apply_plan(root: Path, plan_data: dict[str, Any], confirmed: bool) -> tuple[
     if not isinstance(cfg, dict):
         raise InitError("Plan missing valid config object")
 
-    errs = validate_config(cfg, root)
+    errs = validate_config(cfg, root, expected_version=p_ver)
     if errs:
         raise InitError(errs)
 
@@ -651,13 +1103,11 @@ def apply_plan(root: Path, plan_data: dict[str, Any], confirmed: bool) -> tuple[
     )
 
     if not all_current:
-        # Check stale plan before checking rendered tampering against current disk state
         for rel_path, pf in plan_files.items():
             if disk_shas[rel_path] != pf.get("before_sha256"):
                 raise InitError(f"Stale plan: {rel_path} before SHA256 mismatch (expected {pf.get('before_sha256')}, got {disk_shas[rel_path]})")
 
     # Tamper check: deterministic rendering from cfg and baseline disk state must match plan content
-    # If all_current is True, existing files already match plan, so rendering with existing files matches
     expected = render_managed(root, cfg)
     for rel_path, exp_bytes in expected.items():
         pf = plan_files[rel_path]
@@ -725,6 +1175,7 @@ def apply_plan(root: Path, plan_data: dict[str, Any], confirmed: bool) -> tuple[
 
 
 def get_status(root: Path) -> dict[str, Any]:
+    """Check workspace status, honestly supporting legacy v1 and v2 without auto-conversion."""
     root = root.resolve()
     if not root.is_dir() or _is_reparse_or_link(root):
         return {"status": "invalid", "root": str(root), "errors": ["Root directory invalid, non-existent, or reparse point"]}
@@ -751,27 +1202,141 @@ def get_status(root: Path) -> dict[str, Any]:
 
     try:
         cfg = parse_config_md(cfg_file.read_bytes().decode("utf-8"))
+        ver = cfg.get("schema_version")
+        if type(ver) is not int or isinstance(ver, bool):
+            return {"status": "invalid", "root": str(root), "errors": ["schema_version must be an integer (1 or 2)"]}
         errs = validate_config(cfg, root)
         if errs:
-            return {"status": "invalid", "root": str(root), "state": cfg.get("state"), "errors": errs}
+            return {"status": "invalid", "root": str(root), "schema_version": ver, "state": cfg.get("state"), "errors": errs}
+
         state = cfg.get("state")
-        if state == "enabled":
-            return {"status": "active", "state": "enabled", "root": str(root)}
-        else:
-            return {"status": "inactive", "state": state, "root": str(root)}
+        is_legacy = (ver == 1)
+        res = {
+            "status": "active" if state == "enabled" else "inactive",
+            "state": state,
+            "schema_version": ver,
+            "legacy": is_legacy,
+            "root": str(root),
+        }
+        if is_legacy:
+            res["notice"] = "Running on legacy schema_version 1 configuration. Migration to schema_version 2 available."
+        return res
     except Exception as exc:
         return {"status": "invalid", "root": str(root), "errors": [str(exc)]}
 
+
+def migrate_v1_to_v2(
+    v1_cfg: dict[str, Any],
+    selected_routes: dict[str, str] | None = None,
+    ordered_worker_ids: list[str] | None = None,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Draft a migration from v1 to v2. Requires explicit user decisions for conflicting routes."""
+    if not isinstance(v1_cfg, dict):
+        return None, ["v1 config must be a JSON object"]
+    ver = v1_cfg.get("schema_version")
+    if type(ver) is not int or isinstance(ver, bool) or ver != 1:
+        return None, [f"schema_version must be integer 1 for migration, got {ver!r}"]
+
+    errs = validate_config_v1(v1_cfg)
+    if errs:
+        return None, [f"Invalid v1 config: {'; '.join(errs)}"]
+
+    selected_routes = selected_routes or {}
+    workers = v1_cfg.get("workers", [])
+
+    # Group enabled workers by provider_instance_id
+    provider_workers: dict[str, list[dict[str, Any]]] = {}
+    for w in workers:
+        if w.get("enabled"):
+            pid = w.get("provider_instance_id")
+            provider_workers.setdefault(pid, []).append(w)
+
+    conflicts: list[str] = []
+    for pid, w_list in provider_workers.items():
+        if len(w_list) > 1:
+            if pid not in selected_routes:
+                options_str = ", ".join(f"{w['id']} ({w['route_id']})" for w in w_list)
+                conflicts.append(
+                    f"Provider {pid!r} has multiple enabled routes [{options_str}]. "
+                    f"Choose exactly one via --select-route {pid}=<route_id>"
+                )
+            else:
+                chosen_route = selected_routes[pid]
+                if not any(w["route_id"] == chosen_route for w in w_list):
+                    conflicts.append(f"Selected route {chosen_route!r} does not match any worker for provider {pid!r}")
+
+    if conflicts:
+        return None, conflicts
+
+    # Transform to v2
+    v2_cfg = json.loads(json.dumps(v1_cfg))
+    v2_cfg["schema_version"] = 2
+
+    new_workers = []
+    for w in v2_cfg.get("workers", []):
+        pid = w.get("provider_instance_id")
+        if pid in selected_routes:
+            if w.get("route_id") == selected_routes[pid]:
+                w["enabled"] = True
+                w["disabled_reason"] = None
+            else:
+                w["enabled"] = False
+                w["disabled_reason"] = "inactive provider route alternative"
+                w["execution_evidence"] = None
+        new_workers.append(w)
+
+    # Reorder enabled workers if ordered_worker_ids provided
+    if ordered_worker_ids:
+        seen_order: set[str] = set()
+        for wid in ordered_worker_ids:
+            if wid in seen_order:
+                return None, [f"Duplicate worker id {wid!r} in --order list"]
+            seen_order.add(wid)
+
+        worker_map = {w["id"]: w for w in new_workers}
+        ordered = []
+        for wid in ordered_worker_ids:
+            if wid in worker_map:
+                ordered.append(worker_map[wid])
+            else:
+                return None, [f"Ordered worker id {wid!r} not found in workers"]
+        # Append remaining workers
+        for w in new_workers:
+            if w["id"] not in ordered_worker_ids:
+                ordered.append(w)
+        new_workers = ordered
+
+    v2_cfg["workers"] = new_workers
+
+    # Update boss block
+    boss = v2_cfg.setdefault("boss", {})
+    boss["priority"] = "provider_order"
+    boss["retry_after_successful_tasks"] = 5
+    if "fallback_workers" in boss:
+        del boss["fallback_workers"]
+
+    # Validate emitted draft
+    draft_errs = validate_config_v2(v2_cfg)
+    if draft_errs:
+        return None, [f"Emitted v2 draft configuration failed validation: {'; '.join(draft_errs)}"]
+
+    return v2_cfg, []
+
+
+# ==============================================================================
+# CLI Entrypoint
+# ==============================================================================
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="boss-orchestrator-init local deterministic helper")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_val = sub.add_parser("validate", help="Validate a config file")
+    p_val = sub.add_parser("validate", help="Validate a config file (v1 or v2)")
     p_val.add_argument("--config", type=str, help="Path to config.md or '-' for stdin")
     p_val.add_argument("--root", type=Path, default=Path.cwd(), help="Workspace root")
+    p_val.add_argument("--expected-version", type=int, choices=[1, 2], help="Require specific schema version")
 
-    p_plan = sub.add_parser("plan", help="Render plan for initialization")
+    p_plan = sub.add_parser("plan", help="Render plan for initialization (emits v2)")
     p_plan.add_argument("--root", type=Path, required=True, help="Workspace root")
     p_plan.add_argument("--config", type=str, required=True, help="Path to config.md or '-' for stdin")
     p_plan.add_argument("--out", type=str, help="Optional output path for plan JSON or '-' for stdout")
@@ -783,6 +1348,13 @@ def main() -> int:
 
     p_st = sub.add_parser("status", help="Check workspace orchestration status")
     p_st.add_argument("--root", type=Path, default=Path.cwd(), help="Workspace root")
+
+    p_mig = sub.add_parser("migrate", help="Draft v2 migration from v1 config")
+    p_mig.add_argument("--root", type=Path, default=Path.cwd(), help="Workspace root")
+    p_mig.add_argument("--config", type=str, help="Path to config.md (defaults to .setting/config.md)")
+    p_mig.add_argument("--select-route", action="append", help="Select route: provider_instance_id=route_id")
+    p_mig.add_argument("--order", type=str, help="Comma-separated worker IDs in priority order")
+    p_mig.add_argument("--out", type=str, help="Optional output path for draft config or '-' for stdout")
 
     args = parser.parse_args()
     try:
@@ -796,11 +1368,12 @@ def main() -> int:
                 raw_text = cpath.read_bytes().decode("utf-8")
 
             cfg = parse_config_md(raw_text)
-            errs = validate_config(cfg, args.root.resolve())
+            errs = validate_config(cfg, args.root.resolve(), expected_version=args.expected_version)
             if errs:
                 sys.stderr.write("Validation errors:\n" + "\n".join(f"- {e}" for e in errs) + "\n")
                 return 1
-            print("OK: Config is valid.")
+            ver = cfg.get("schema_version")
+            print(f"OK: Config (schema_version {ver}) is valid.")
             return 0
 
         elif args.cmd == "plan":
@@ -854,6 +1427,52 @@ def main() -> int:
             st = get_status(args.root)
             print(json.dumps(st, indent=2))
             return 0 if st.get("status") == "active" else 1
+
+        elif args.cmd == "migrate":
+            cpath = Path(args.config) if args.config else (args.root / ".setting/config.md")
+            if not cpath.is_file():
+                raise InitError(f"Config file not found: {cpath}")
+            raw_text = cpath.read_bytes().decode("utf-8")
+            cfg = parse_config_md(raw_text)
+
+            ver = cfg.get("schema_version")
+            if type(ver) is int and not isinstance(ver, bool) and ver == 2:
+                print("Config is already schema_version 2. No migration needed.")
+                return 0
+
+            selected_map: dict[str, str] = {}
+            if args.select_route:
+                for item in args.select_route:
+                    if "=" not in item:
+                        raise InitError(f"Invalid --select-route format {item!r}; expected provider_id=route_id")
+                    k, v = item.split("=", 1)
+                    selected_map[k.strip()] = v.strip()
+
+            order_list: list[str] | None = None
+            if args.order:
+                order_list = [x.strip() for x in args.order.split(",") if x.strip()]
+
+            v2_draft, issues = migrate_v1_to_v2(cfg, selected_map, order_list)
+            if issues:
+                res = {
+                    "status": "migration_choices_required",
+                    "current_version": 1,
+                    "target_version": 2,
+                    "issues": issues,
+                    "usage": "Run migrate with --select-route <provider>=<route_id> and --order <worker1,worker2,...>"
+                }
+                print(json.dumps(res, indent=2))
+                return 1
+
+            rendered_draft = f"{CONFIG_INTRO}\n```json\n{json.dumps(v2_draft, indent=2)}\n```\n"
+            if args.out and args.out != "-":
+                out_path = Path(args.out)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_bytes(rendered_draft.encode("utf-8"))
+                print(f"Migration draft v2 config saved to {args.out}")
+            else:
+                print(rendered_draft)
+            return 0
 
     except InitError as ie:
         sys.stderr.write(f"Error: {ie}\n")
