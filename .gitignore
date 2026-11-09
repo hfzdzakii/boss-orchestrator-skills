@@ -17,3 +17,4 @@ research*.md
 .venv/
 env/
 venv/
+/.boss-orchestrator/

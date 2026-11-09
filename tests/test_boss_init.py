@@ -820,7 +820,7 @@ class TestBossInit(unittest.TestCase):
         plan = boss_init.make_plan(self.root, cfg_path.read_bytes().decode("utf-8"))
         boss_init.apply_plan(self.root, plan, confirmed=True)
 
-        (self.root / ".setting/boss-orchestrator.md").unlink()
+        (self.root / ".boss-orchestrator/runtime-policy.md").unlink()
         st = boss_init.get_status(self.root)
         self.assertEqual(st["status"], "invalid")
         self.assertTrue(any("runtime policy missing" in e for e in st["errors"]))
@@ -834,7 +834,7 @@ class TestBossInit(unittest.TestCase):
         with self.assertRaises(boss_init.InitError) as cm:
             boss_init.make_plan(self.root, cfg_path.read_bytes().decode("utf-8"))
         self.assertIn("AGENTS.override.md is present and non-empty", str(cm.exception))
-        self.assertFalse((self.root / ".setting").exists())
+        self.assertFalse((self.root / ".boss-orchestrator").exists())
 
     def test_claude_md_coexistence(self):
         (self.root / "CLAUDE.md").write_bytes(b"# Project Claude Instructions")
@@ -855,7 +855,7 @@ class TestBossInit(unittest.TestCase):
         plan = boss_init.make_plan(self.root, cfg_path.read_bytes().decode("utf-8"))
         boss_init.apply_plan(self.root, plan, confirmed=True)
 
-        setting_cfg = self.root / ".setting/config.md"
+        target_cfg = self.root / ".boss-orchestrator/config.md"
         custom_content = (
             "# Custom Team Config Notes\n\n"
             "Important team routing comments here.\n\n"
@@ -864,14 +864,14 @@ class TestBossInit(unittest.TestCase):
             + "\n```\n\n"
             "Footer team operations notes.\n"
         )
-        setting_cfg.write_bytes(custom_content.encode("utf-8"))
+        target_cfg.write_bytes(custom_content.encode("utf-8"))
 
         cfg["workers"][0]["label"] = "Updated Worker Label"
         write_config_md(cfg_path, cfg)
         plan2 = boss_init.make_plan(self.root, cfg_path.read_bytes().decode("utf-8"))
         boss_init.apply_plan(self.root, plan2, confirmed=True)
 
-        updated_text = setting_cfg.read_bytes().decode("utf-8")
+        updated_text = target_cfg.read_bytes().decode("utf-8")
         self.assertIn("# Custom Team Config Notes", updated_text)
         self.assertIn("Important team routing comments here.", updated_text)
         self.assertIn("Footer team operations notes.", updated_text)
@@ -903,12 +903,12 @@ class TestBossInit(unittest.TestCase):
         with self.assertRaises(boss_init.InitError):
             boss_init._safe_resolve(self.root, "../escaped.txt")
 
-        link_path = self.root / ".setting"
+        link_path = self.root / ".boss-orchestrator"
         try:
             outside_dir = tempfile.mkdtemp()
             os.symlink(outside_dir, link_path)
             with self.assertRaises(boss_init.InitError) as cm:
-                boss_init._safe_resolve(self.root, ".setting/config.md")
+                boss_init._safe_resolve(self.root, ".boss-orchestrator/config.md")
             self.assertIn("Symlink, junction, or reparse point rejected", str(cm.exception))
         except (OSError, NotImplementedError):
             pass
@@ -1251,6 +1251,628 @@ class TestBossInit(unittest.TestCase):
         self.assertEqual(issues_ok, [])
         self.assertIsNotNone(draft_ok)
         self.assertEqual(boss_init.validate_config_v2(draft_ok), [])
+
+    # --------------------------------------------------------------------------
+    # Gitignore Management Tests
+    # --------------------------------------------------------------------------
+    def test_gitignore_fresh_creation(self):
+        cfg = make_valid_config_v2(self.root)
+        cfg_path = self.root / "config.md"
+        write_config_md(cfg_path, cfg)
+
+        gitignore_path = self.root / ".gitignore"
+        self.assertFalse(gitignore_path.exists())
+
+        plan = boss_init.make_plan(self.root, cfg_path.read_bytes().decode("utf-8"))
+        gi_entry = next(f for f in plan["files"] if f["path"] == ".gitignore")
+        self.assertIn("/.boss-orchestrator/", gi_entry["content"])
+        self.assertIsNone(gi_entry["before_sha256"])
+        self.assertIsNotNone(gi_entry["after_sha256"])
+
+        # Verification: not written during plan
+        self.assertFalse(gitignore_path.exists())
+
+        code, _ = boss_init.apply_plan(self.root, plan, confirmed=True)
+        self.assertEqual(code, 0)
+        self.assertTrue(gitignore_path.is_file())
+        self.assertEqual(gitignore_path.read_bytes(), b"/.boss-orchestrator/\n")
+
+    def test_gitignore_existing_preserved_and_appended(self):
+        gitignore_path = self.root / ".gitignore"
+        existing = (
+            "# Project exclusions\n"
+            "node_modules/\n"
+            "*.tmp\n"
+            "/.setting/\n"
+        )
+        gitignore_path.write_bytes(existing.encode("utf-8"))
+
+        cfg = make_valid_config_v2(self.root)
+        cfg_path = self.root / "config.md"
+        write_config_md(cfg_path, cfg)
+
+        plan = boss_init.make_plan(self.root, cfg_path.read_bytes().decode("utf-8"))
+        code, _ = boss_init.apply_plan(self.root, plan, confirmed=True)
+        self.assertEqual(code, 0)
+
+        content = gitignore_path.read_bytes().decode("utf-8")
+        self.assertTrue(content.startswith(existing))
+        self.assertIn("/.boss-orchestrator/\n", content)
+        self.assertIn("/.setting/\n", content)
+
+    def test_gitignore_missing_trailing_newline_handled(self):
+        gitignore_path = self.root / ".gitignore"
+        existing = "node_modules"  # No trailing newline
+        gitignore_path.write_bytes(existing.encode("utf-8"))
+
+        cfg = make_valid_config_v2(self.root)
+        cfg_path = self.root / "config.md"
+        write_config_md(cfg_path, cfg)
+
+        plan = boss_init.make_plan(self.root, cfg_path.read_bytes().decode("utf-8"))
+        code, _ = boss_init.apply_plan(self.root, plan, confirmed=True)
+        self.assertEqual(code, 0)
+
+        content = gitignore_path.read_bytes().decode("utf-8")
+        self.assertEqual(content, "node_modules\n/.boss-orchestrator/\n")
+
+    def test_gitignore_idempotent_no_duplicate(self):
+        gitignore_path = self.root / ".gitignore"
+        existing = (
+            "# Exclusions\n"
+            "/.boss-orchestrator/\n"
+            "*.log\n"
+        )
+        gitignore_path.write_bytes(existing.encode("utf-8"))
+
+        cfg = make_valid_config_v2(self.root)
+        cfg_path = self.root / "config.md"
+        write_config_md(cfg_path, cfg)
+
+        plan = boss_init.make_plan(self.root, cfg_path.read_bytes().decode("utf-8"))
+        gi_entry = next(f for f in plan["files"] if f["path"] == ".gitignore")
+        self.assertEqual(gi_entry["diff"], "")
+        self.assertEqual(gi_entry["before_sha256"], gi_entry["after_sha256"])
+
+        code, _ = boss_init.apply_plan(self.root, plan, confirmed=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(gitignore_path.read_bytes(), existing.encode("utf-8"))
+
+    def test_gitignore_negation_overridden(self):
+        gitignore_path = self.root / ".gitignore"
+        existing = (
+            "/.boss-orchestrator/\n"
+            "!/.boss-orchestrator/\n"  # Negated: target is un-ignored
+        )
+        gitignore_path.write_bytes(existing.encode("utf-8"))
+
+        cfg = make_valid_config_v2(self.root)
+        cfg_path = self.root / "config.md"
+        write_config_md(cfg_path, cfg)
+
+        plan = boss_init.make_plan(self.root, cfg_path.read_bytes().decode("utf-8"))
+        gi_entry = next(f for f in plan["files"] if f["path"] == ".gitignore")
+        self.assertNotEqual(gi_entry["diff"], "")
+        self.assertIn("/.boss-orchestrator/", gi_entry["content"].splitlines()[-1])
+
+    def test_gitignore_bom_and_crlf_preserved(self):
+        gitignore_path = self.root / ".gitignore"
+        raw_bom_crlf = (
+            b"\xef\xbb\xbf"  # UTF-8 BOM
+            b"# Header\r\n"
+            b"target/\r\n"
+        )
+        gitignore_path.write_bytes(raw_bom_crlf)
+
+        cfg = make_valid_config_v2(self.root)
+        cfg_path = self.root / "config.md"
+        write_config_md(cfg_path, cfg)
+
+        plan = boss_init.make_plan(self.root, cfg_path.read_bytes().decode("utf-8"))
+        code, _ = boss_init.apply_plan(self.root, plan, confirmed=True)
+        self.assertEqual(code, 0)
+
+        updated_bytes = gitignore_path.read_bytes()
+        self.assertTrue(updated_bytes.startswith(b"\xef\xbb\xbf"))
+        self.assertIn(b"/.boss-orchestrator/\r\n", updated_bytes)
+
+    def test_gitignore_stale_detected(self):
+        gitignore_path = self.root / ".gitignore"
+        gitignore_path.write_bytes(b"initial/\n")
+
+        cfg = make_valid_config_v2(self.root)
+        cfg_path = self.root / "config.md"
+        write_config_md(cfg_path, cfg)
+
+        plan = boss_init.make_plan(self.root, cfg_path.read_bytes().decode("utf-8"))
+        # File drifts before apply
+        gitignore_path.write_bytes(b"drifted/\n")
+
+        with self.assertRaises(boss_init.InitError) as cm:
+            boss_init.apply_plan(self.root, plan, confirmed=True)
+        self.assertIn("Stale plan: .gitignore before SHA256 mismatch", str(cm.exception))
+
+    def test_gitignore_tamper_detected(self):
+        gitignore_path = self.root / ".gitignore"
+        gitignore_path.write_bytes(b"initial/\n")
+
+        cfg = make_valid_config_v2(self.root)
+        cfg_path = self.root / "config.md"
+        write_config_md(cfg_path, cfg)
+
+        plan = boss_init.make_plan(self.root, cfg_path.read_bytes().decode("utf-8"))
+        gi_entry = next(f for f in plan["files"] if f["path"] == ".gitignore")
+        gi_entry["content"] = "tampered content"
+
+        with self.assertRaises(boss_init.InitError) as cm:
+            boss_init.apply_plan(self.root, plan, confirmed=True)
+        self.assertIn("Plan tampering detected", str(cm.exception))
+
+    def test_gitignore_rollback_on_failure(self):
+        gitignore_path = self.root / ".gitignore"
+        orig_bytes = b"original_gitignore_content\n"
+        gitignore_path.write_bytes(orig_bytes)
+
+        cfg = make_valid_config_v2(self.root)
+        cfg_path = self.root / "config.md"
+        write_config_md(cfg_path, cfg)
+
+        plan = boss_init.make_plan(self.root, cfg_path.read_bytes().decode("utf-8"))
+
+        orig_replace = os.replace
+        call_count = [0]
+
+        def failing_replace(src, dst):
+            call_count[0] += 1
+            if call_count[0] == 2:
+                raise OSError("Simulated write failure")
+            orig_replace(src, dst)
+
+        os.replace = failing_replace
+        try:
+            with self.assertRaises(boss_init.InitError):
+                boss_init.apply_plan(self.root, plan, confirmed=True)
+        finally:
+            os.replace = orig_replace
+
+        self.assertEqual(gitignore_path.read_bytes(), orig_bytes)
+
+    def test_git_check_ignore_integration(self):
+        # Only run if git executable is present
+        try:
+            res = subprocess.run(["git", "--version"], capture_output=True, text=True)
+            if res.returncode != 0:
+                self.skipTest("git not available")
+        except FileNotFoundError:
+            self.skipTest("git binary not installed")
+
+        # Initialize git repo in self.root
+        subprocess.run(["git", "init"], cwd=self.root, capture_output=True, check=True)
+
+        cfg = make_valid_config_v2(self.root)
+        cfg_path = self.root / "config.md"
+        write_config_md(cfg_path, cfg)
+
+        plan = boss_init.make_plan(self.root, cfg_path.read_bytes().decode("utf-8"))
+        boss_init.apply_plan(self.root, plan, confirmed=True)
+
+        # Check with git check-ignore that .boss-orchestrator files are ignored
+        check = subprocess.run(
+            ["git", "check-ignore", "-v", "--", ".boss-orchestrator/config.md"],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(check.returncode, 0, f"git check-ignore failed: {check.stderr}")
+        self.assertIn(".boss-orchestrator", check.stdout)
+
+    # --------------------------------------------------------------------------
+    # Dual Layout and Conflict Detection Tests
+    # --------------------------------------------------------------------------
+    def test_status_both_layouts_conflict(self):
+        # Create new layout files
+        (self.root / ".boss-orchestrator").mkdir(parents=True, exist_ok=True)
+        (self.root / ".boss-orchestrator/config.md").write_text("# New config\n```json\n{}\n```\n")
+        (self.root / ".boss-orchestrator/runtime-policy.md").write_text("# New policy")
+
+        # Create legacy layout files
+        (self.root / ".setting").mkdir(parents=True, exist_ok=True)
+        (self.root / ".setting/config.md").write_text("# Legacy config\n```json\n{}\n```\n")
+        (self.root / ".setting/boss-orchestrator.md").write_text("# Legacy policy")
+
+        st = boss_init.get_status(self.root)
+        self.assertEqual(st["status"], "invalid")
+        self.assertTrue(any("Conflict: both new layout (.boss-orchestrator) and legacy layout (.setting) exist" in e for e in st["errors"]))
+
+    def test_status_new_layout_active(self):
+        cfg = make_valid_config_v2(self.root, state="enabled")
+        cfg_path = self.root / "config.md"
+        write_config_md(cfg_path, cfg)
+        plan = boss_init.make_plan(self.root, cfg_path.read_bytes().decode("utf-8"))
+        boss_init.apply_plan(self.root, plan, confirmed=True)
+
+        st = boss_init.get_status(self.root)
+        self.assertEqual(st["status"], "active")
+        self.assertEqual(st["layout"], ".boss-orchestrator")
+        self.assertFalse(st["legacy"])
+
+    # --------------------------------------------------------------------------
+    # Path-Only Migration Tests
+    # --------------------------------------------------------------------------
+    def test_path_migration_plan_preserves_v1_and_routing(self):
+        v1_cfg = make_valid_config_v1(self.root, state="enabled")
+        setting_dir = self.root / ".setting"
+        setting_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path = setting_dir / "config.md"
+
+        custom_prose = (
+            "# boss-orchestrator workspace config\n\n"
+            "Read by .setting/boss-orchestrator.md. Developer notes.\n\n"
+            "```json\n"
+            + json.dumps(v1_cfg, indent=2)
+            + "\n```\n\n"
+            "Custom footer notes for the team.\n"
+        )
+        cfg_path.write_bytes(custom_prose.encode("utf-8"))
+
+        runtime_path = setting_dir / "boss-orchestrator.md"
+        runtime_text = (
+            "---\ntitle: runtime policy\npolicy_text_version: 1\n---\n"
+            "# boss-orchestrator runtime policy\n"
+            "Copied into .setting/boss-orchestrator.md.\n"
+            "Binds to .setting/config.md which is also this `.setting` directory's parent.\n"
+        )
+        runtime_path.write_bytes(runtime_text.encode("utf-8"))
+
+        agents_file = self.root / "AGENTS.md"
+        agents_content = (
+            "# My Root AGENTS\n\n"
+            f"{boss_init.MARKER_BEGIN}\n"
+            "For the top-level parent session in this workspace, follow .setting/boss-orchestrator.md\n"
+            f"{boss_init.MARKER_END}\n\n"
+            "## Matt Pocock section\n"
+        )
+        agents_file.write_bytes(agents_content.encode("utf-8"))
+
+        plan = boss_init.make_path_migration_plan(self.root)
+
+        # Invariants:
+        self.assertEqual(plan["migration_type"], "path_only")
+        self.assertEqual(plan["version"], 1)
+        self.assertEqual(plan["config"]["schema_version"], 1)
+        # Both opencode routes preserved:
+        self.assertEqual(len(plan["config"]["workers"]), 2)
+        self.assertEqual(plan["config"]["workers"][0]["id"], "worker-1")
+        self.assertEqual(plan["config"]["workers"][1]["id"], "worker-2")
+
+        # Files planned:
+        paths = [f["path"] for f in plan["files"]]
+        self.assertIn(".boss-orchestrator/config.md", paths)
+        self.assertIn(".boss-orchestrator/runtime-policy.md", paths)
+        self.assertIn("AGENTS.md", paths)
+        self.assertIn(".gitignore", paths)
+
+        # Developer prose preserved:
+        cfg_f = next(f for f in plan["files"] if f["path"] == ".boss-orchestrator/config.md")
+        self.assertIn("Custom footer notes for the team.", cfg_f["content"])
+        self.assertIn("Read by .boss-orchestrator/runtime-policy.md.", cfg_f["content"])
+
+        # Target runtime policy preserves v1 policy text and semantics:
+        rt_f = next(f for f in plan["files"] if f["path"] == ".boss-orchestrator/runtime-policy.md")
+        self.assertIn("policy_text_version: 1", rt_f["content"])
+        self.assertIn(".boss-orchestrator/runtime-policy.md", rt_f["content"])
+        self.assertIn(".boss-orchestrator/config.md", rt_f["content"])
+        self.assertNotIn(".setting", rt_f["content"])
+
+        # AGENTS.md outside marker preserved:
+        ag_f = next(f for f in plan["files"] if f["path"] == "AGENTS.md")
+        self.assertTrue(ag_f["content"].startswith("# My Root AGENTS\n\n"))
+        self.assertIn("## Matt Pocock section\n", ag_f["content"])
+
+        # Verify no files written to disk during plan:
+        self.assertFalse((self.root / ".boss-orchestrator").exists())
+
+    def test_path_migration_apply_confirmed(self):
+        v1_cfg = make_valid_config_v1(self.root, state="enabled")
+        setting_dir = self.root / ".setting"
+        setting_dir.mkdir(parents=True, exist_ok=True)
+        (setting_dir / "config.md").write_bytes(f"{boss_init.CONFIG_INTRO}\n```json\n{json.dumps(v1_cfg, indent=2)}\n```\n".encode("utf-8"))
+        (setting_dir / "boss-orchestrator.md").write_bytes(b"# Policy\n.setting/config.md\n")
+        (self.root / "AGENTS.md").write_bytes(f"{boss_init.MARKER_BEGIN}\nold\n{boss_init.MARKER_END}\n".encode("utf-8"))
+
+        plan = boss_init.make_path_migration_plan(self.root)
+        code, msg = boss_init.apply_path_migration_plan(self.root, plan, confirmed=True)
+        self.assertEqual(code, 0)
+
+        # Target files exist
+        self.assertTrue((self.root / ".boss-orchestrator/config.md").is_file())
+        self.assertTrue((self.root / ".boss-orchestrator/runtime-policy.md").is_file())
+        self.assertTrue((self.root / ".gitignore").is_file())
+
+        # Legacy files unlinked and .setting removed
+        self.assertFalse((self.root / ".setting/config.md").exists())
+        self.assertFalse((self.root / ".setting/boss-orchestrator.md").exists())
+        self.assertFalse((self.root / ".setting").exists())
+
+        # Status is active with layout .boss-orchestrator and legacy schema v1
+        st = boss_init.get_status(self.root)
+        self.assertEqual(st["status"], "active")
+        self.assertEqual(st["layout"], ".boss-orchestrator")
+        self.assertEqual(st["schema_version"], 1)
+        self.assertTrue(st["legacy"])
+
+    def test_path_migration_preserves_unrelated_files_in_setting(self):
+        v1_cfg = make_valid_config_v1(self.root, state="enabled")
+        setting_dir = self.root / ".setting"
+        setting_dir.mkdir(parents=True, exist_ok=True)
+        (setting_dir / "config.md").write_bytes(f"{boss_init.CONFIG_INTRO}\n```json\n{json.dumps(v1_cfg, indent=2)}\n```\n".encode("utf-8"))
+        (setting_dir / "boss-orchestrator.md").write_bytes(b"# Policy")
+        (setting_dir / "custom_notes.txt").write_bytes(b"Important developer notes preserved!")
+        (self.root / "AGENTS.md").write_bytes(f"{boss_init.MARKER_BEGIN}\nold\n{boss_init.MARKER_END}\n".encode("utf-8"))
+
+        plan = boss_init.make_path_migration_plan(self.root)
+        code, _ = boss_init.apply_path_migration_plan(self.root, plan, confirmed=True)
+        self.assertEqual(code, 0)
+
+        # Unrelated files and .setting directory preserved!
+        self.assertTrue(setting_dir.is_dir())
+        self.assertTrue((setting_dir / "custom_notes.txt").is_file())
+        self.assertEqual((setting_dir / "custom_notes.txt").read_bytes(), b"Important developer notes preserved!")
+
+        # Only migrated files were unlinked
+        self.assertFalse((setting_dir / "config.md").exists())
+        self.assertFalse((setting_dir / "boss-orchestrator.md").exists())
+
+    def test_path_migration_refuses_overwrite(self):
+        v1_cfg = make_valid_config_v1(self.root)
+        setting_dir = self.root / ".setting"
+        setting_dir.mkdir(parents=True, exist_ok=True)
+        (setting_dir / "config.md").write_bytes(f"{boss_init.CONFIG_INTRO}\n```json\n{json.dumps(v1_cfg, indent=2)}\n```\n".encode("utf-8"))
+        (setting_dir / "boss-orchestrator.md").write_bytes(b"# Policy")
+
+        # Existing target file already present
+        new_dir = self.root / ".boss-orchestrator"
+        new_dir.mkdir(parents=True, exist_ok=True)
+        (new_dir / "config.md").write_bytes(b"pre-existing target")
+
+        with self.assertRaises(boss_init.InitError) as cm:
+            boss_init.make_path_migration_plan(self.root)
+        self.assertIn("already exists; refusing to overwrite", str(cm.exception))
+
+    def test_path_migration_stale_legacy_detected(self):
+        v1_cfg = make_valid_config_v1(self.root)
+        setting_dir = self.root / ".setting"
+        setting_dir.mkdir(parents=True, exist_ok=True)
+        (setting_dir / "config.md").write_bytes(f"{boss_init.CONFIG_INTRO}\n```json\n{json.dumps(v1_cfg, indent=2)}\n```\n".encode("utf-8"))
+        (setting_dir / "boss-orchestrator.md").write_bytes(b"# Policy")
+        (self.root / "AGENTS.md").write_bytes(f"{boss_init.MARKER_BEGIN}\nold\n{boss_init.MARKER_END}\n".encode("utf-8"))
+
+        plan = boss_init.make_path_migration_plan(self.root)
+
+        # Legacy file drifts after plan
+        (setting_dir / "config.md").write_bytes(b"# Tampered legacy config")
+
+        with self.assertRaises(boss_init.InitError) as cm:
+            boss_init.apply_path_migration_plan(self.root, plan, confirmed=True)
+        self.assertIn("Stale migration plan: legacy file .setting/config.md before SHA256 mismatch", str(cm.exception))
+
+    def test_path_migration_rollback_on_failure(self):
+        v1_cfg = make_valid_config_v1(self.root)
+        setting_dir = self.root / ".setting"
+        setting_dir.mkdir(parents=True, exist_ok=True)
+        cfg_bytes = f"{boss_init.CONFIG_INTRO}\n```json\n{json.dumps(v1_cfg, indent=2)}\n```\n".encode("utf-8")
+        (setting_dir / "config.md").write_bytes(cfg_bytes)
+        (setting_dir / "boss-orchestrator.md").write_bytes(b"# Policy")
+        (self.root / "AGENTS.md").write_bytes(f"{boss_init.MARKER_BEGIN}\nold\n{boss_init.MARKER_END}\n".encode("utf-8"))
+
+        plan = boss_init.make_path_migration_plan(self.root)
+
+        orig_replace = os.replace
+        call_count = [0]
+
+        def failing_replace(src, dst):
+            call_count[0] += 1
+            if call_count[0] == 2:
+                raise OSError("Simulated write failure during migration replace")
+            orig_replace(src, dst)
+
+        os.replace = failing_replace
+        try:
+            with self.assertRaises(boss_init.InitError) as cm:
+                boss_init.apply_path_migration_plan(self.root, plan, confirmed=True)
+            self.assertIn("Write failure, rolled back", str(cm.exception))
+        finally:
+            os.replace = orig_replace
+
+        # Verify full restoration of .setting
+        self.assertEqual((setting_dir / "config.md").read_bytes(), cfg_bytes)
+        self.assertEqual((setting_dir / "boss-orchestrator.md").read_bytes(), b"# Policy")
+
+    def test_path_migration_rejects_arbitrary_cleanup_files(self):
+        v1_cfg = make_valid_config_v1(self.root)
+        setting_dir = self.root / ".setting"
+        setting_dir.mkdir(parents=True, exist_ok=True)
+        (setting_dir / "config.md").write_bytes(f"{boss_init.CONFIG_INTRO}\n```json\n{json.dumps(v1_cfg, indent=2)}\n```\n".encode("utf-8"))
+        (setting_dir / "boss-orchestrator.md").write_bytes(b"# Policy")
+
+        plan = boss_init.make_path_migration_plan(self.root)
+        # Attacker injects arbitrary cleanup file (e.g. package.json deletion attack)
+        plan["cleanup_files"].append({
+            "path": "package.json",
+            "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        })
+
+        with self.assertRaises(boss_init.InitError) as cm:
+            boss_init.apply_path_migration_plan(self.root, plan, confirmed=True)
+        self.assertIn("Plan cleanup_files mismatch expected exact legacy cleanup set", str(cm.exception))
+
+    def test_path_migration_rejects_arbitrary_destination_paths(self):
+        v1_cfg = make_valid_config_v1(self.root)
+        setting_dir = self.root / ".setting"
+        setting_dir.mkdir(parents=True, exist_ok=True)
+        (setting_dir / "config.md").write_bytes(f"{boss_init.CONFIG_INTRO}\n```json\n{json.dumps(v1_cfg, indent=2)}\n```\n".encode("utf-8"))
+        (setting_dir / "boss-orchestrator.md").write_bytes(b"# Policy")
+
+        plan = boss_init.make_path_migration_plan(self.root)
+        # Attacker injects arbitrary destination file path
+        evil_content = "echo malicious"
+        evil_sha = boss_init.sha256_bytes(evil_content.encode("utf-8"))
+        plan["files"].append({
+            "path": "malicious.sh",
+            "before_sha256": None,
+            "after_sha256": evil_sha,
+            "content": evil_content,
+            "diff": "+echo malicious\n",
+        })
+
+        with self.assertRaises(boss_init.InitError) as cm:
+            boss_init.apply_path_migration_plan(self.root, plan, confirmed=True)
+        self.assertIn("Plan files mismatch expected exact MANAGED_FILES", str(cm.exception))
+
+    def test_path_migration_rejects_duplicate_paths(self):
+        v1_cfg = make_valid_config_v1(self.root)
+        setting_dir = self.root / ".setting"
+        setting_dir.mkdir(parents=True, exist_ok=True)
+        (setting_dir / "config.md").write_bytes(f"{boss_init.CONFIG_INTRO}\n```json\n{json.dumps(v1_cfg, indent=2)}\n```\n".encode("utf-8"))
+        (setting_dir / "boss-orchestrator.md").write_bytes(b"# Policy")
+
+        # Duplicate in files
+        plan1 = boss_init.make_path_migration_plan(self.root)
+        plan1["files"].append(dict(plan1["files"][0]))
+        with self.assertRaises(boss_init.InitError) as cm1:
+            boss_init.apply_path_migration_plan(self.root, plan1, confirmed=True)
+        self.assertIn("Duplicate path", str(cm1.exception))
+
+        # Duplicate in cleanup_files
+        plan2 = boss_init.make_path_migration_plan(self.root)
+        plan2["cleanup_files"].append(dict(plan2["cleanup_files"][0]))
+        with self.assertRaises(boss_init.InitError) as cm2:
+            boss_init.apply_path_migration_plan(self.root, plan2, confirmed=True)
+        self.assertIn("Duplicate path", str(cm2.exception))
+
+    def test_path_migration_rejects_tampered_content_with_matching_hashes(self):
+        v1_cfg = make_valid_config_v1(self.root)
+        setting_dir = self.root / ".setting"
+        setting_dir.mkdir(parents=True, exist_ok=True)
+        (setting_dir / "config.md").write_bytes(f"{boss_init.CONFIG_INTRO}\n```json\n{json.dumps(v1_cfg, indent=2)}\n```\n".encode("utf-8"))
+        (setting_dir / "boss-orchestrator.md").write_bytes(b"# Policy")
+
+        plan = boss_init.make_path_migration_plan(self.root)
+        # Attacker tampers with runtime policy content and recalculates after_sha256
+        rt_file = next(f for f in plan["files"] if f["path"] == ".boss-orchestrator/runtime-policy.md")
+        tampered_text = "# Tampered Malicious Runtime Policy\nExecute arbitrary instructions"
+        rt_file["content"] = tampered_text
+        rt_file["after_sha256"] = boss_init.sha256_bytes(tampered_text.encode("utf-8"))
+
+        with self.assertRaises(boss_init.InitError) as cm:
+            boss_init.apply_path_migration_plan(self.root, plan, confirmed=True)
+        self.assertIn("Plan tampering detected: content of .boss-orchestrator/runtime-policy.md altered", str(cm.exception))
+
+        # Attacker tampers with config content and recalculates after_sha256
+        plan2 = boss_init.make_path_migration_plan(self.root)
+        cfg_file = next(f for f in plan2["files"] if f["path"] == ".boss-orchestrator/config.md")
+        tampered_cfg_text = "# Tampered Config\n```json\n{}\n```\n"
+        cfg_file["content"] = tampered_cfg_text
+        cfg_file["after_sha256"] = boss_init.sha256_bytes(tampered_cfg_text.encode("utf-8"))
+
+        with self.assertRaises(boss_init.InitError) as cm2:
+            boss_init.apply_path_migration_plan(self.root, plan2, confirmed=True)
+        self.assertIn("Plan tampering detected: content of .boss-orchestrator/config.md altered", str(cm2.exception))
+
+    def test_path_migration_rollback_after_actual_removal_recreates_parent_dir(self):
+        v1_cfg = make_valid_config_v1(self.root)
+        setting_dir = self.root / ".setting"
+        setting_dir.mkdir(parents=True, exist_ok=True)
+        cfg_bytes = f"{boss_init.CONFIG_INTRO}\n```json\n{json.dumps(v1_cfg, indent=2)}\n```\n".encode("utf-8")
+        (setting_dir / "config.md").write_bytes(cfg_bytes)
+        (setting_dir / "boss-orchestrator.md").write_bytes(b"# Original Legacy Policy")
+        (self.root / "AGENTS.md").write_bytes(f"{boss_init.MARKER_BEGIN}\nold\n{boss_init.MARKER_END}\n".encode("utf-8"))
+
+        plan = boss_init.make_path_migration_plan(self.root)
+
+        orig_rmdir = Path.rmdir
+
+        def injected_rmdir(path_obj):
+            # Actually remove directory, then raise exception simulating crash right after rmdir
+            orig_rmdir(path_obj)
+            raise RuntimeError("Injected exception after actual legacy directory removal")
+
+        Path.rmdir = injected_rmdir
+        try:
+            with self.assertRaises(boss_init.InitError) as cm:
+                boss_init.apply_path_migration_plan(self.root, plan, confirmed=True)
+            self.assertIn("Write failure, rolled back", str(cm.exception))
+        finally:
+            Path.rmdir = orig_rmdir
+
+        # Verify parent directory was safely recreated and legacy files restored with exact bytes
+        self.assertTrue(setting_dir.is_dir())
+        self.assertEqual((setting_dir / "config.md").read_bytes(), cfg_bytes)
+        self.assertEqual((setting_dir / "boss-orchestrator.md").read_bytes(), b"# Original Legacy Policy")
+
+        # Verify target files cleaned up (no half-migrated state or target loss)
+        self.assertFalse((self.root / ".boss-orchestrator/config.md").exists())
+        self.assertFalse((self.root / ".boss-orchestrator/runtime-policy.md").exists())
+        self.assertFalse((self.root / ".boss-orchestrator").exists())
+
+    def test_gitignore_false_positive_child_negation_fixed(self):
+        text = "/.boss-orchestrator/*\n!/.boss-orchestrator/config.md\n"
+        # Must NOT falsely claim target is ignored
+        self.assertFalse(boss_init.is_target_ignored_in_gitignore(text))
+
+        rendered = boss_init.render_gitignore_bytes(text.encode("utf-8"))
+        rendered_text = rendered.decode("utf-8")
+        lines = [l.strip() for l in rendered_text.splitlines() if l.strip()]
+        self.assertEqual(lines[-1], "/.boss-orchestrator/")
+
+        # Repeated rendering must be idempotent
+        re_rendered = boss_init.render_gitignore_bytes(rendered)
+        self.assertEqual(re_rendered, rendered)
+
+    def test_gitignore_git_check_ignore_and_status_comprehensive(self):
+        try:
+            res = subprocess.run(["git", "--version"], capture_output=True, text=True)
+            if res.returncode != 0:
+                self.skipTest("git not available")
+        except FileNotFoundError:
+            self.skipTest("git binary not installed")
+
+        repo_dir = self.root / "sub_git_test"
+        repo_dir.mkdir()
+        subprocess.run(["git", "init"], cwd=repo_dir, capture_output=True, check=True)
+
+        test_cases = [
+            ("child negation", b"/.boss-orchestrator/*\n!/.boss-orchestrator/config.md\n"),
+            ("wildcard blanket negation", b"/target\n!*\n"),
+            ("dir negation", b"/.boss-orchestrator/\n!/.boss-orchestrator/\n"),
+            ("dot wildcard negation", b"/.boss-orchestrator/\n!.*\n"),
+            ("BOM and CRLF with child negation", b"\xef\xbb\xbf# Header\r\n/.boss-orchestrator/*\r\n!/.boss-orchestrator/config.md\r\n"),
+        ]
+
+        for label, raw_gi in test_cases:
+            rendered = boss_init.render_gitignore_bytes(raw_gi)
+            # Repeated rendering must be idempotent
+            rerendered = boss_init.render_gitignore_bytes(rendered)
+            self.assertEqual(rerendered, rendered, f"Idempotency failed for {label}")
+
+            # Write to gitignore
+            (repo_dir / ".gitignore").write_bytes(rendered)
+
+            # Create target files
+            target_dir = repo_dir / ".boss-orchestrator"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            (target_dir / "config.md").write_text("config_content")
+            (target_dir / "runtime-policy.md").write_text("policy_content")
+
+            # Verify with git check-ignore for config.md AND runtime-policy.md
+            r_cfg = subprocess.run(["git", "check-ignore", "-q", ".boss-orchestrator/config.md"], cwd=repo_dir)
+            r_rt = subprocess.run(["git", "check-ignore", "-q", ".boss-orchestrator/runtime-policy.md"], cwd=repo_dir)
+            self.assertEqual(r_cfg.returncode, 0, f"{label}: config.md not ignored")
+            self.assertEqual(r_rt.returncode, 0, f"{label}: runtime-policy.md not ignored")
+
+            # Also verify with git status porcelain that nothing in .boss-orchestrator is untracked
+            st = subprocess.run(["git", "status", "--porcelain"], cwd=repo_dir, capture_output=True, text=True)
+            self.assertNotIn(".boss-orchestrator", st.stdout, f"{label}: leaked into git status: {st.stdout}")
 
 
 if __name__ == "__main__":

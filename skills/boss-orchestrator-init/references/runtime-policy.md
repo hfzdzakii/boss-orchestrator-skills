@@ -5,7 +5,7 @@ policy_text_version: 2
 
 # boss-orchestrator runtime policy
 
-You are reading the self-contained, versioned runtime contract of a boss-orchestrator initialized workspace. The initializer copied this file to `.setting/boss-orchestrator.md` so the workspace stays fully self-contained after the initializer skill is removed, uninstalled, or updated.
+You are reading the self-contained, versioned runtime contract of a boss-orchestrator initialized workspace. The initializer copied this file to `.boss-orchestrator/runtime-policy.md` so the workspace stays fully self-contained after the initializer skill is removed, uninstalled, or updated.
 
 ## Role guard — read before anything else
 
@@ -19,22 +19,22 @@ A nested `AGENTS.md` / `AGENTS.override.md` can replace this workspace's instruc
 
 ## Binding
 
-This policy, and the `boss` block in `.setting/config.md`, bind strictly to the workspace root recorded in `scope.root`, which is also this `.setting` directory's parent. A different checkout, a separate worktree, or a directory outside this tree is a different scope: do not apply this policy there, and do not copy the config into it. Initialize that workspace separately.
+This policy, and the `boss` block in `.boss-orchestrator/config.md`, bind strictly to the workspace root recorded in `scope.root`, which is also this `.boss-orchestrator` directory's parent. A different checkout, a separate worktree, or a directory outside this tree is a different scope: do not apply this policy there, and do not copy the config into it. Initialize that workspace separately.
 
 ## Startup check
 
 At session start in this workspace, before the first delegation of the session:
 
-1. Verify orchestration state: read `.setting/config.md` directly (or invoke the initializer helper `status` command via its absolute path if the tool is installed) and check `scope.root` and `state`.
+1. Verify orchestration state: read `.boss-orchestrator/config.md` directly (or invoke the initializer helper `status` command via its absolute path if the tool is installed) and check `scope.root` and `state`.
 2. `active`: if `state` is `enabled` and the configuration is valid (schema_version 2, or recognized legacy v1), the workspace orchestration policy is active.
 3. `inactive`: if `state` is `draft` or `disabled`, workspace orchestration is inactive. Continue ordinary work normally without delegation enforcement.
-4. `invalid` / `uninitialized`: if `.setting/config.md` or `.setting/boss-orchestrator.md` is missing, or validation fails, treat orchestration as inactive. Tell the user validation failed, quote the reason, and run ordinary work yourself without the boss contract. Never repair the config or rewrite the runtime policy at startup.
+4. `invalid` / `uninitialized`: if `.boss-orchestrator/config.md` or `.boss-orchestrator/runtime-policy.md` is missing, or validation fails, treat orchestration as inactive. Tell the user validation failed, quote the reason, and run ordinary work yourself without the boss contract. Never repair the config or rewrite the runtime policy at startup.
 
 Light validation uses one local inspection (file reads, JSON schema checks, symlink checks). It makes no network call, no model probe, and no write. Never start an interview or a probe run at startup, and never rewrite files because validation complained.
 
 ## Boss contract
 
-The boss keeps the user-selected parent provider, model, and options. `.setting/config.md` must say `parent.selection: current_active`; that token is a sentinel, not a model name — do not send it to an API and do not switch the parent model.
+The boss keeps the user-selected parent provider, model, and options. `.boss-orchestrator/config.md` must say `parent.selection: current_active`; that token is a sentinel, not a model name — do not send it to an API and do not switch the parent model.
 
 The boss:
 
@@ -50,7 +50,7 @@ The boss:
 
 ## Workers and ordered routing policy
 
-Workers come only from `workers[]` in `.setting/config.md`. An entry is eligible when `enabled` is true and its exact `provider_instance_id`, `driver_kind`, `route_id`, and `options` still resolve in this environment. Entries disabled by the config show their reason and stay disabled until the user re-decides; a disabled entry is never matched to a similarly named model.
+Workers come only from `workers[]` in `.boss-orchestrator/config.md`. An entry is eligible when `enabled` is true and its exact `provider_instance_id`, `driver_kind`, `route_id`, and `options` still resolve in this environment. Entries disabled by the config show their reason and stay disabled until the user re-decides; a disabled entry is never matched to a similarly named model.
 
 Selection and execution:
 
@@ -109,11 +109,11 @@ Catalog presence is not authentication or a successful run; a run does not prove
 
 ## Threads and continuity
 
-Read this policy once at session start and keep it in the session, not in any file. A new session re-reads `.setting/config.md` and this file instead of relying on remembered settings. Never start a model probe or interview to rebuild context.
+Read this policy once at session start and keep it in the session, not in any file. A new session re-reads `.boss-orchestrator/config.md` and this file instead of relying on remembered settings. Never start a model probe or interview to rebuild context.
 
 ## Workspace changes
 
-The `boss` block in `.setting/config.md` is the boss's decision record; after initialization only the initialization flow with user approval rewrites it. Anyone may edit `scope`, `confirmation`, root pointers, and Matt-owned sections by hand. `.setting/boss-orchestrator.md` is initializer-owned runtime text.
+The `boss` block in `.boss-orchestrator/config.md` is the boss's decision record; after initialization only the initialization flow with user approval rewrites it. Anyone may edit `scope`, `confirmation`, root pointers, and Matt-owned sections by hand. `.boss-orchestrator/runtime-policy.md` is initializer-owned runtime text.
 
 User text outside the managed marker block stays as written. The Matt Pocock `## Agent skills` block, if present, belongs to Matt's setup and is not edited or removed here. The initializer does not install Matt skills or change issue trackers, labels, or remotes. Existing Matt skills stay usable: the boss owns a workflow that needs review rounds or background research and hands leaf workers concrete, self-contained tasks.
 

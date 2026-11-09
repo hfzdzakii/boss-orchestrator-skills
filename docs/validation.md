@@ -21,7 +21,7 @@
   - **Deterministic Pure SessionRouter State Machine (Verification / Reference Module)**:
     - Pure reference module: live routing instruction-governed by orchestrator without harness middleware.
     - Single source of order: enabled worker list order strictly determines priority. Priority 1 is selected for primary dispatches.
-    - Capacity queueing: when Priority 1 capacity is full, action is `queue`, avoiding spilling to lower priority solely for speed.
+    - Capacity queueing: when Priority 1 capacity is full, action is `queue`, avoiding spilling to lower priority solely for speed. Verified that queueing is instruction-governed by the orchestrator within turn without overclaiming automatic background scheduler daemons.
     - Operational error advance: operational error (auth, quota, timeout, connection) immediately stops dispatching on affected provider and advances to the next eligible priority.
     - In-flight identity & terminal registry: requires valid dispatched in-flight identity on completion, prevents all replay and unknown task completions, rejects worker mismatch before mutation.
     - Strict handoff contract: validates all fields and types in `HandoffBrief` including `cancellation_uncertain_effects` and list element types.
@@ -43,7 +43,7 @@
     - Symlink, NTFS junction, and reparse point rejection.
     - Instruction override protection (`AGENTS.override.md` presence rejection).
     - Byte-for-byte preservation of raw CRLF line endings, UTF-8 BOM, and Matt Pocock `## Agent skills` blocks.
-    - Developer prose preservation outside fenced JSON blocks in `.setting/config.md`.
+    - Developer prose preservation outside fenced JSON blocks in `.boss-orchestrator/config.md`.
 
 ## Helper and Migration Workflows
 - Deterministic helper (`scripts/boss_init.py`) verified offline in standard-library Python.

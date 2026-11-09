@@ -7,7 +7,7 @@ Live routing during task execution is instruction-governed by the top-level orch
 without runtime harness middleware or hooks.
 """
 from __future__ import annotations
-import argparse, difflib, hashlib, json, os, re, sys
+import argparse, difflib, fnmatch, hashlib, json, os, re, sys
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -18,22 +18,23 @@ SCHEMA_VERSION = 2
 SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 MARKER_BEGIN = "<!-- boss-orchestrator-init:begin v1 -->"
 MARKER_END = "<!-- boss-orchestrator-init:end v1 -->"
-MANAGED_FILES = ("AGENTS.md", ".setting/config.md", ".setting/boss-orchestrator.md")
+MANAGED_FILES = ("AGENTS.md", ".boss-orchestrator/config.md", ".boss-orchestrator/runtime-policy.md", ".gitignore")
+LEGACY_CLEANUP_FILES = (".setting/config.md", ".setting/boss-orchestrator.md")
 ID_RE, DATE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$"), re.compile(r"^\d{4}-\d{2}-\d{2}$")
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 AGENTS_BLOCK = """## boss-orchestrator (workspace orchestration)
 
 For the top-level parent session in this workspace, follow the policy in
-`.setting/boss-orchestrator.md` and the workers in `.setting/config.md`. At session
-start, read both files and check `scope.root` and `state`; if `.setting` is missing,
+`.boss-orchestrator/runtime-policy.md` and the workers in `.boss-orchestrator/config.md`. At session
+start, read both files and check `scope.root` and `state`; if `.boss-orchestrator` is missing,
 the root does not match, or `state` is not `enabled`, workspace orchestration is
 inactive. Work delegated to you as a child task is not covered by this block:
 do the task yourself."""
 
 CONFIG_INTRO = """# boss-orchestrator workspace config
 
-Read by .setting/boss-orchestrator.md. The single fenced json block below is the only
+Read by .boss-orchestrator/runtime-policy.md. The single fenced json block below is the only
 machine-read part of this file; null means unresolved, never wildcard or permission.
 """
 
@@ -946,6 +947,11 @@ def render_config_bytes(cfg: dict[str, Any], existing_bytes: bytes | None) -> by
         before_lines = lines[:f1]
         after_lines = lines[f2 + 1:]
 
+        before_lines = [
+            l.replace(".setting/boss-orchestrator.md", ".boss-orchestrator/runtime-policy.md")
+            for l in before_lines
+        ]
+
         json_lines = json_str.splitlines()
         new_block = [f"{fence_marker}json"] + json_lines + [fence_marker]
 
@@ -958,6 +964,69 @@ def render_config_bytes(cfg: dict[str, Any], existing_bytes: bytes | None) -> by
     return res.encode("utf-8")
 
 
+def is_target_ignored_in_gitignore(text: str, target: str = "/.boss-orchestrator/") -> bool:
+    """Check if target directory is effectively and conservatively ignored by gitignore text.
+
+    Requires an active directory-level ignore rule that is not negated by subsequent
+    rules, child negations, or blanket negations.
+    """
+    target_dir = target.strip("/").lower()
+    dir_patterns = {f"/{target_dir}/", f"{target_dir}/", f"/{target_dir}", target_dir}
+    dir_ignored = False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("!"):
+            pat = line[1:].strip().lower()
+            is_blanket = pat in ("*", "/*", ".*", "/.*", "**", "/**")
+            pat_clean = pat.strip("/")
+            matches_dir = (
+                pat in dir_patterns
+                or fnmatch.fnmatch(target_dir, pat_clean)
+                or fnmatch.fnmatch(f"/{target_dir}", pat.rstrip("/"))
+            )
+            is_child = (
+                pat.startswith((f"{target_dir}/", f"/{target_dir}/"))
+                or f"{target_dir}/" in pat
+            )
+            if is_blanket or matches_dir or is_child:
+                dir_ignored = False
+        else:
+            pat = line.lower()
+            if pat in dir_patterns:
+                dir_ignored = True
+    return dir_ignored
+
+
+def render_gitignore_bytes(existing_bytes: bytes | None) -> bytes:
+    """Render .gitignore ensuring root /.boss-orchestrator/ is effectively ignored without duplicates."""
+    RULE = "/.boss-orchestrator/"
+    if existing_bytes is None:
+        return f"{RULE}\n".encode("utf-8")
+
+    has_bom = existing_bytes.startswith(b"\xef\xbb\xbf")
+    raw = existing_bytes[3:] if has_bom else existing_bytes
+
+    newline_str = "\r\n" if b"\r\n" in raw else "\n"
+    newline_bytes = newline_str.encode("utf-8")
+
+    text = raw.decode("utf-8", errors="replace")
+    if is_target_ignored_in_gitignore(text, RULE):
+        return existing_bytes
+
+    if raw.endswith(b"\r\n") or raw.endswith(b"\n"):
+        res = raw + f"{RULE}{newline_str}".encode("utf-8")
+    elif len(raw) == 0:
+        res = f"{RULE}{newline_str}".encode("utf-8")
+    else:
+        res = raw + newline_bytes + f"{RULE}{newline_str}".encode("utf-8")
+
+    if has_bom:
+        res = b"\xef\xbb\xbf" + res
+    return res
+
+
 def render_managed(root: Path, cfg: dict[str, Any], existing_override: dict[str, bytes | None] | None = None) -> dict[str, bytes]:
     if existing_override and "AGENTS.md" in existing_override:
         existing_agents = existing_override["AGENTS.md"]
@@ -965,16 +1034,23 @@ def render_managed(root: Path, cfg: dict[str, Any], existing_override: dict[str,
         agents_path = _safe_resolve(root, "AGENTS.md")
         existing_agents = agents_path.read_bytes() if agents_path.is_file() else None
 
-    if existing_override and ".setting/config.md" in existing_override:
-        existing_config = existing_override[".setting/config.md"]
+    if existing_override and ".boss-orchestrator/config.md" in existing_override:
+        existing_config = existing_override[".boss-orchestrator/config.md"]
     else:
-        config_path = _safe_resolve(root, ".setting/config.md")
+        config_path = _safe_resolve(root, ".boss-orchestrator/config.md")
         existing_config = config_path.read_bytes() if config_path.is_file() else None
+
+    if existing_override and ".gitignore" in existing_override:
+        existing_gitignore = existing_override[".gitignore"]
+    else:
+        gitignore_path = _safe_resolve(root, ".gitignore")
+        existing_gitignore = gitignore_path.read_bytes() if gitignore_path.is_file() else None
 
     return {
         "AGENTS.md": render_agents_bytes(existing_agents),
-        ".setting/config.md": render_config_bytes(cfg, existing_config),
-        ".setting/boss-orchestrator.md": get_runtime_template_bytes(),
+        ".boss-orchestrator/config.md": render_config_bytes(cfg, existing_config),
+        ".boss-orchestrator/runtime-policy.md": get_runtime_template_bytes(),
+        ".gitignore": render_gitignore_bytes(existing_gitignore),
     }
 
 
@@ -1035,14 +1111,17 @@ def apply_plan(root: Path, plan_data: dict[str, Any], confirmed: bool) -> tuple[
     if not confirmed:
         raise InitError("Apply refused: --confirmed flag required for execution")
 
+    if not isinstance(plan_data, dict):
+        raise InitError("Plan data must be a JSON object")
+
+    if plan_data.get("migration_type") == "path_only":
+        return apply_path_migration_plan(root, plan_data, confirmed)
+
     root = root.resolve()
     if not root.is_dir() or _is_reparse_or_link(root):
         raise InitError(f"Root does not exist, is not a directory, or is a reparse point: {root}")
 
     _check_agents_override(root)
-
-    if not isinstance(plan_data, dict):
-        raise InitError("Plan data must be a JSON object")
 
     p_ver = plan_data.get("version")
     if type(p_ver) is not int or isinstance(p_ver, bool) or p_ver not in SUPPORTED_SCHEMA_VERSIONS:
@@ -1174,8 +1253,396 @@ def apply_plan(root: Path, plan_data: dict[str, Any], confirmed: bool) -> tuple[
         raise InitError(f"Write failure, rolled back: {exc}") from exc
 
 
+def make_path_migration_plan(root: Path) -> dict[str, Any]:
+    """Create an exact path-only migration plan from .setting to .boss-orchestrator.
+
+    Preserves approved schema version (v1 or v2), worker routing, and user prose byte-for-byte.
+    Does NOT write any files to disk during plan creation.
+    """
+    root = root.resolve()
+    if not root.is_dir() or _is_reparse_or_link(root):
+        raise InitError(f"Root does not exist, is not a directory, or is a reparse point: {root}")
+
+    _check_agents_override(root)
+
+    legacy_cfg = _safe_resolve(root, ".setting/config.md")
+    legacy_runtime = _safe_resolve(root, ".setting/boss-orchestrator.md")
+    if not legacy_cfg.is_file():
+        raise InitError("Legacy config .setting/config.md not found; cannot perform path migration")
+    if not legacy_runtime.is_file():
+        raise InitError("Legacy runtime policy .setting/boss-orchestrator.md not found; cannot perform path migration")
+
+    target_cfg = _safe_resolve(root, ".boss-orchestrator/config.md")
+    target_runtime = _safe_resolve(root, ".boss-orchestrator/runtime-policy.md")
+
+    # Protection: No overwrites
+    if target_cfg.exists():
+        raise InitError("Target .boss-orchestrator/config.md already exists; refusing to overwrite")
+    if target_runtime.exists():
+        raise InitError("Target .boss-orchestrator/runtime-policy.md already exists; refusing to overwrite")
+
+    # Read legacy config & preserve schema version and routing exactly
+    legacy_cfg_bytes = legacy_cfg.read_bytes()
+    cfg = parse_config_md(legacy_cfg_bytes.decode("utf-8"))
+    ver = cfg.get("schema_version")
+    if type(ver) is not int or isinstance(ver, bool) or ver not in SUPPORTED_SCHEMA_VERSIONS:
+        raise InitError(f"Unsupported schema_version {ver!r} in legacy config")
+
+    errs = validate_config(cfg, root, expected_version=ver)
+    if errs:
+        raise InitError([f"Legacy config invalid: {e}" for e in errs])
+
+    # Render target config, preserving user prose and updating header
+    target_cfg_bytes = render_config_bytes(cfg, legacy_cfg_bytes)
+
+    # Render target runtime policy, retaining policy text version and updating path references
+    legacy_runtime_text = legacy_runtime.read_bytes().decode("utf-8")
+    target_runtime_text = (
+        legacy_runtime_text
+        .replace(".setting/boss-orchestrator.md", ".boss-orchestrator/runtime-policy.md")
+        .replace(".setting/config.md", ".boss-orchestrator/config.md")
+        .replace("which is also this `.setting` directory's parent", "which is also this `.boss-orchestrator` directory's parent")
+        .replace(".setting", ".boss-orchestrator")
+    )
+    target_runtime_bytes = target_runtime_text.encode("utf-8")
+
+    # Render AGENTS.md
+    agents_path = _safe_resolve(root, "AGENTS.md")
+    existing_agents = agents_path.read_bytes() if agents_path.is_file() else None
+    target_agents_bytes = render_agents_bytes(existing_agents)
+
+    # Render .gitignore
+    gitignore_path = _safe_resolve(root, ".gitignore")
+    existing_gitignore = gitignore_path.read_bytes() if gitignore_path.is_file() else None
+    target_gitignore_bytes = render_gitignore_bytes(existing_gitignore)
+
+    rendered: dict[str, bytes] = {
+        ".boss-orchestrator/config.md": target_cfg_bytes,
+        ".boss-orchestrator/runtime-policy.md": target_runtime_bytes,
+        "AGENTS.md": target_agents_bytes,
+        ".gitignore": target_gitignore_bytes,
+    }
+
+    files_plan = []
+    for rel_path, new_bytes in rendered.items():
+        fpath = _safe_resolve(root, rel_path)
+        cur_bytes = fpath.read_bytes() if fpath.is_file() else None
+        b_sha, a_sha = sha256_bytes(cur_bytes), sha256_bytes(new_bytes)
+        cur_text = cur_bytes.decode("utf-8", errors="replace") if cur_bytes is not None else ""
+        new_text = new_bytes.decode("utf-8")
+        diff = "".join(
+            difflib.unified_diff(
+                cur_text.splitlines(keepends=True),
+                new_text.splitlines(keepends=True),
+                fromfile=f"a/{rel_path}",
+                tofile=f"b/{rel_path}",
+            )
+        )
+        files_plan.append({
+            "path": rel_path,
+            "before_sha256": b_sha,
+            "after_sha256": a_sha,
+            "content": new_text,
+            "diff": diff,
+        })
+
+    cleanup_files = [
+        {
+            "path": ".setting/config.md",
+            "before_sha256": sha256_bytes(legacy_cfg_bytes),
+        },
+        {
+            "path": ".setting/boss-orchestrator.md",
+            "before_sha256": sha256_bytes(legacy_runtime.read_bytes()),
+        },
+    ]
+
+    return {
+        "migration_type": "path_only",
+        "version": ver,
+        "root": str(root),
+        "config": cfg,
+        "files": files_plan,
+        "cleanup_files": cleanup_files,
+    }
+
+
+def apply_path_migration_plan(root: Path, plan_data: dict[str, Any], confirmed: bool) -> tuple[int, str]:
+    if not confirmed:
+        raise InitError("Apply refused: --confirmed flag required for execution")
+
+    root = root.resolve()
+    if not root.is_dir() or _is_reparse_or_link(root):
+        raise InitError(f"Root does not exist, is not a directory, or is a reparse point: {root}")
+
+    _check_agents_override(root)
+
+    if not isinstance(plan_data, dict):
+        raise InitError("Plan data must be a JSON object")
+
+    if plan_data.get("migration_type") != "path_only":
+        raise InitError("Expected migration_type 'path_only' in plan")
+
+    p_ver = plan_data.get("version")
+    if type(p_ver) is not int or isinstance(p_ver, bool) or p_ver not in SUPPORTED_SCHEMA_VERSIONS:
+        raise InitError(f"Plan version mismatch: expected integer in {SUPPORTED_SCHEMA_VERSIONS}")
+
+    plan_root_raw = plan_data.get("root")
+    if not isinstance(plan_root_raw, str):
+        raise InitError("Plan root must be a string")
+    plan_root = Path(plan_root_raw).resolve()
+    if root != plan_root:
+        raise InitError(f"Plan root mismatch: plan for {str(plan_root)!r}, target is {str(root)!r}")
+
+    cfg = plan_data.get("config")
+    if not isinstance(cfg, dict):
+        raise InitError("Plan missing valid config object")
+
+    ver = cfg.get("schema_version")
+    if ver != p_ver:
+        raise InitError(f"Config schema_version {ver!r} does not match plan version {p_ver!r}")
+    errs = validate_config(cfg, root, expected_version=ver)
+    if errs:
+        raise InitError(errs)
+
+    raw_files = plan_data.get("files")
+    if not isinstance(raw_files, list):
+        raise InitError("Plan files must be a list")
+
+    seen_paths: set[str] = set()
+    plan_files: dict[str, dict[str, Any]] = {}
+    for pf in raw_files:
+        if not isinstance(pf, dict):
+            raise InitError("Plan file entry must be a JSON object")
+        p = pf.get("path")
+        if not isinstance(p, str):
+            raise InitError("Plan file path must be a string")
+        if p in seen_paths:
+            raise InitError(f"Duplicate path {p!r} in plan files")
+        seen_paths.add(p)
+
+        f_content = pf.get("content")
+        if not isinstance(f_content, str):
+            raise InitError(f"Plan file {p} content must be string")
+
+        b_sha = pf.get("before_sha256")
+        if b_sha is not None and not isinstance(b_sha, str):
+            raise InitError(f"Plan file {p} before_sha256 must be string or null")
+
+        a_sha = pf.get("after_sha256")
+        if not isinstance(a_sha, str):
+            raise InitError(f"Plan file {p} after_sha256 must be string")
+
+        diff = pf.get("diff")
+        if not isinstance(diff, str):
+            raise InitError(f"Plan file {p} diff must be string")
+
+        if a_sha != sha256_bytes(f_content.encode("utf-8")):
+            raise InitError(f"Plan tampering detected: after_sha256 mismatch for {p}")
+
+        plan_files[p] = pf
+
+    if seen_paths != set(MANAGED_FILES):
+        raise InitError(f"Plan files mismatch expected exact MANAGED_FILES {set(MANAGED_FILES)}, found {seen_paths}")
+
+    raw_cleanup = plan_data.get("cleanup_files")
+    if not isinstance(raw_cleanup, list):
+        raise InitError("Plan cleanup_files must be a list")
+
+    seen_cleanup: set[str] = set()
+    plan_cleanup: dict[str, dict[str, Any]] = {}
+    for cf in raw_cleanup:
+        if not isinstance(cf, dict):
+            raise InitError("Plan cleanup entry must be a JSON object")
+        cp = cf.get("path")
+        if not isinstance(cp, str):
+            raise InitError("Cleanup file path must be a string")
+        if cp in seen_cleanup:
+            raise InitError(f"Duplicate path {cp!r} in plan cleanup_files")
+        seen_cleanup.add(cp)
+
+        cb_sha = cf.get("before_sha256")
+        if not isinstance(cb_sha, str):
+            raise InitError(f"Cleanup file {cp} before_sha256 must be string")
+        plan_cleanup[cp] = cf
+
+    if seen_cleanup != set(LEGACY_CLEANUP_FILES):
+        raise InitError(f"Plan cleanup_files mismatch expected exact legacy cleanup set {set(LEGACY_CLEANUP_FILES)}, found {seen_cleanup}")
+
+    # Check if already in planned state
+    all_target_current = all(
+        (_safe_resolve(root, rp).is_file() and sha256_bytes(_safe_resolve(root, rp).read_bytes()) == pf.get("after_sha256"))
+        for rp, pf in plan_files.items()
+    )
+    all_cleanup_gone = all(
+        not (root / cf["path"]).exists()
+        for cf in raw_cleanup
+    )
+    if all_target_current and all_cleanup_gone:
+        return 2, "Workspace already in planned state. No changes written."
+
+    # Check stale plan against current disk state for target files
+    for rel_path, pf in plan_files.items():
+        target = _safe_resolve(root, rel_path)
+        cur_b = target.read_bytes() if target.is_file() else None
+        cur_sha = sha256_bytes(cur_b)
+        if cur_sha != pf.get("before_sha256"):
+            if cur_b is not None and pf.get("before_sha256") is None:
+                raise InitError(f"Target file {rel_path} exists; refusing to overwrite")
+            raise InitError(f"Stale plan: {rel_path} before SHA256 mismatch")
+
+    # Check stale plan against current disk state for legacy cleanup files
+    for cf in raw_cleanup:
+        rel_path = cf["path"]
+        target = _safe_resolve(root, rel_path)
+        if not target.is_file():
+            raise InitError(f"Stale migration plan: legacy file {rel_path} not found")
+        cur_b = target.read_bytes()
+        if sha256_bytes(cur_b) != cf.get("before_sha256"):
+            raise InitError(f"Stale migration plan: legacy file {rel_path} before SHA256 mismatch")
+
+    # Protection: No overwrites
+    for rel_path in (".boss-orchestrator/config.md", ".boss-orchestrator/runtime-policy.md"):
+        target = _safe_resolve(root, rel_path)
+        if target.exists() and plan_files.get(rel_path, {}).get("before_sha256") is None:
+            raise InitError(f"Target file {rel_path} exists; refusing to overwrite")
+
+    # Deterministic recomputation comparison: reject tampered content even with self-consistent hashes
+    expected_plan = make_path_migration_plan(root)
+    if plan_data.get("version") != expected_plan.get("version"):
+        raise InitError("Plan tampering detected: version mismatch")
+    if plan_data.get("config") != expected_plan.get("config"):
+        raise InitError("Plan tampering detected: config mismatch")
+
+    expected_files = {f["path"]: f for f in expected_plan.get("files", [])}
+    for rel_path, pf in plan_files.items():
+        exp_f = expected_files.get(rel_path)
+        if not exp_f:
+            raise InitError(f"Plan tampering detected: unexpected file {rel_path}")
+        if pf["content"] != exp_f["content"]:
+            raise InitError(f"Plan tampering detected: content of {rel_path} altered")
+        if pf["before_sha256"] != exp_f["before_sha256"]:
+            raise InitError(f"Plan tampering detected: before_sha256 mismatch for {rel_path}")
+        if pf["after_sha256"] != exp_f["after_sha256"]:
+            raise InitError(f"Plan tampering detected: after_sha256 mismatch for {rel_path}")
+
+    expected_cleanups = {cf["path"]: cf for cf in expected_plan.get("cleanup_files", [])}
+    for cf in raw_cleanup:
+        cp = cf["path"]
+        exp_c = expected_cleanups.get(cp)
+        if not exp_c:
+            raise InitError(f"Plan tampering detected: unexpected cleanup file {cp}")
+        if cf["before_sha256"] != exp_c["before_sha256"]:
+            raise InitError(f"Plan tampering detected: before_sha256 mismatch for cleanup file {cp}")
+
+    temp_files: list[tuple[Path, Path]] = []
+    backups: dict[Path, bytes | None] = {}
+    cleanup_backups: dict[Path, bytes] = {}
+    created_dirs: list[Path] = []
+
+    try:
+        # Pre-create and write temp files for target files
+        for rel_path, pf in plan_files.items():
+            target = _safe_resolve(root, rel_path)
+            cur_b = target.read_bytes() if target.is_file() else None
+            target_bytes = pf["content"].encode("utf-8")
+            if cur_b != target_bytes:
+                parent = target.parent
+                if not parent.exists():
+                    parent.mkdir(parents=True, exist_ok=True)
+                    created_dirs.append(parent)
+                if _is_reparse_or_link(parent):
+                    raise InitError(f"Parent directory of {rel_path} is a reparse point")
+                backups[target] = cur_b
+                tmp = parent / f".tmp_{target.name}_{os.getpid()}_{len(temp_files)}"
+                tmp.write_bytes(target_bytes)
+                temp_files.append((tmp, target))
+
+        # Atomically replace target files
+        for tmp, target in temp_files:
+            os.replace(tmp, target)
+        temp_files.clear()
+
+        # Remove legacy cleanup files
+        for cf in raw_cleanup:
+            rel_path = cf["path"]
+            legacy_file = _safe_resolve(root, rel_path)
+            if legacy_file.is_file():
+                cleanup_backups[legacy_file] = legacy_file.read_bytes()
+                legacy_file.unlink()
+
+        # Safely remove .setting directory ONLY if empty (no recursive delete, preserve unrelated files)
+        legacy_dir = root / ".setting"
+        if legacy_dir.is_dir():
+            try:
+                legacy_dir.rmdir()
+            except OSError:
+                pass
+
+        return 0, f"Successfully migrated path layout to .boss-orchestrator in {root}"
+
+    except Exception as exc:
+        rollback_errors = []
+        for lf, content in cleanup_backups.items():
+            try:
+                parent = lf.parent
+                if not parent.exists():
+                    parent.mkdir(parents=True, exist_ok=True)
+                if _is_reparse_or_link(parent):
+                    raise InitError(f"Restored directory {parent} is a reparse point")
+                lf.write_bytes(content)
+            except Exception as r_exc:
+                rollback_errors.append(f"failed to restore {lf}: {r_exc}")
+        for target, prev_b in backups.items():
+            try:
+                if prev_b is None:
+                    if target.exists():
+                        target.unlink()
+                else:
+                    target.write_bytes(prev_b)
+            except Exception as r_exc:
+                rollback_errors.append(f"failed to restore {target}: {r_exc}")
+        for tmp, _ in temp_files:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception as r_exc:
+                rollback_errors.append(f"failed to delete temp file {tmp}: {r_exc}")
+        for d in reversed(created_dirs):
+            try:
+                if d.is_dir() and not any(d.iterdir()):
+                    d.rmdir()
+            except Exception:
+                pass
+
+        if rollback_errors:
+            raise InitError(f"Write failure; rollback partially failed ({'; '.join(rollback_errors)}), original error: {exc}") from exc
+        raise InitError(f"Write failure, rolled back: {exc}") from exc
+
+
+def _find_default_config(root: Path) -> Path:
+    new_c = root / ".boss-orchestrator/config.md"
+    legacy_c = root / ".setting/config.md"
+    has_new = new_c.is_file()
+    has_legacy = legacy_c.is_file()
+    if has_new and has_legacy:
+        raise InitError(
+            "Conflict: both .boss-orchestrator/config.md and .setting/config.md exist. "
+            "Resolve conflict to avoid ambiguous selection."
+        )
+    if has_new:
+        return new_c
+    if has_legacy:
+        return legacy_c
+    return new_c
+
+
 def get_status(root: Path) -> dict[str, Any]:
-    """Check workspace status, honestly supporting legacy v1 and v2 without auto-conversion."""
+    """Check workspace status, honestly supporting legacy v1 and v2 without auto-conversion.
+
+    Detects new layout (.boss-orchestrator) and legacy layout (.setting).
+    Fails clearly if both layouts exist simultaneously to prevent ambiguous orchestration.
+    """
     root = root.resolve()
     if not root.is_dir() or _is_reparse_or_link(root):
         return {"status": "invalid", "root": str(root), "errors": ["Root directory invalid, non-existent, or reparse point"]}
@@ -1184,13 +1651,34 @@ def get_status(root: Path) -> dict[str, Any]:
     if override_path.is_file() and len(override_path.read_bytes().strip()) > 0:
         return {"status": "invalid", "root": str(root), "errors": ["Root AGENTS.override.md is present and non-empty"]}
 
-    cfg_file = root / ".setting/config.md"
-    if not cfg_file.is_file():
+    new_cfg = root / ".boss-orchestrator/config.md"
+    new_runtime = root / ".boss-orchestrator/runtime-policy.md"
+    legacy_cfg = root / ".setting/config.md"
+    legacy_runtime = root / ".setting/boss-orchestrator.md"
+
+    has_new = new_cfg.is_file()
+    has_legacy = legacy_cfg.is_file()
+
+    if has_new and has_legacy:
+        return {
+            "status": "invalid",
+            "root": str(root),
+            "errors": [
+                "Conflict: both new layout (.boss-orchestrator) and legacy layout (.setting) exist. "
+                "Resolve conflict by archiving or removing the unneeded layout to avoid ambiguous orchestration."
+            ]
+        }
+
+    if not has_new and not has_legacy:
         return {"status": "uninitialized", "root": str(root)}
 
-    runtime_file = root / ".setting/boss-orchestrator.md"
+    is_legacy_layout = has_legacy
+    cfg_file = legacy_cfg if is_legacy_layout else new_cfg
+    runtime_file = legacy_runtime if is_legacy_layout else new_runtime
+    expected_runtime_name = ".setting/boss-orchestrator.md" if is_legacy_layout else ".boss-orchestrator/runtime-policy.md"
+
     if not runtime_file.is_file():
-        return {"status": "invalid", "root": str(root), "errors": [".setting/boss-orchestrator.md runtime policy missing"]}
+        return {"status": "invalid", "root": str(root), "errors": [f"{expected_runtime_name} runtime policy missing"]}
 
     agents_file = root / "AGENTS.md"
     if not agents_file.is_file():
@@ -1210,16 +1698,22 @@ def get_status(root: Path) -> dict[str, Any]:
             return {"status": "invalid", "root": str(root), "schema_version": ver, "state": cfg.get("state"), "errors": errs}
 
         state = cfg.get("state")
-        is_legacy = (ver == 1)
+        is_legacy_schema = (ver == 1)
         res = {
             "status": "active" if state == "enabled" else "inactive",
             "state": state,
             "schema_version": ver,
-            "legacy": is_legacy,
+            "layout": ".setting" if is_legacy_layout else ".boss-orchestrator",
+            "legacy": is_legacy_schema or is_legacy_layout,
             "root": str(root),
         }
-        if is_legacy:
-            res["notice"] = "Running on legacy schema_version 1 configuration. Migration to schema_version 2 available."
+        notices = []
+        if is_legacy_layout:
+            notices.append("Running on legacy layout (.setting). Path migration to .boss-orchestrator available.")
+        if is_legacy_schema:
+            notices.append("Running on legacy schema_version 1 configuration. Migration to schema_version 2 available.")
+        if notices:
+            res["notice"] = " ".join(notices)
         return res
     except Exception as exc:
         return {"status": "invalid", "root": str(root), "errors": [str(exc)]}
@@ -1332,13 +1826,14 @@ def main() -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_val = sub.add_parser("validate", help="Validate a config file (v1 or v2)")
-    p_val.add_argument("--config", type=str, help="Path to config.md or '-' for stdin")
+    p_val.add_argument("--config", type=str, help="Path to config.md or '-' for stdin (defaults to active layout config)")
     p_val.add_argument("--root", type=Path, default=Path.cwd(), help="Workspace root")
     p_val.add_argument("--expected-version", type=int, choices=[1, 2], help="Require specific schema version")
 
-    p_plan = sub.add_parser("plan", help="Render plan for initialization (emits v2)")
+    p_plan = sub.add_parser("plan", help="Render plan for initialization (emits v2) or path migration")
     p_plan.add_argument("--root", type=Path, required=True, help="Workspace root")
-    p_plan.add_argument("--config", type=str, required=True, help="Path to config.md or '-' for stdin")
+    p_plan.add_argument("--config", type=str, help="Path to config.md or '-' for stdin")
+    p_plan.add_argument("--path-only", action="store_true", help="Generate path migration plan from .setting to .boss-orchestrator")
     p_plan.add_argument("--out", type=str, help="Optional output path for plan JSON or '-' for stdout")
 
     p_app = sub.add_parser("apply", help="Apply a generated plan")
@@ -1349,12 +1844,20 @@ def main() -> int:
     p_st = sub.add_parser("status", help="Check workspace orchestration status")
     p_st.add_argument("--root", type=Path, default=Path.cwd(), help="Workspace root")
 
-    p_mig = sub.add_parser("migrate", help="Draft v2 migration from v1 config")
+    p_mig = sub.add_parser("migrate", help="Draft v2 migration from v1 config or path-only migration")
     p_mig.add_argument("--root", type=Path, default=Path.cwd(), help="Workspace root")
-    p_mig.add_argument("--config", type=str, help="Path to config.md (defaults to .setting/config.md)")
+    p_mig.add_argument("--config", type=str, help="Path to config.md (defaults to active layout config)")
+    p_mig.add_argument("--path-only", action="store_true", help="Generate path migration plan from .setting to .boss-orchestrator preserving schema and routing")
     p_mig.add_argument("--select-route", action="append", help="Select route: provider_instance_id=route_id")
     p_mig.add_argument("--order", type=str, help="Comma-separated worker IDs in priority order")
-    p_mig.add_argument("--out", type=str, help="Optional output path for draft config or '-' for stdout")
+    p_mig.add_argument("--out", type=str, help="Optional output path for draft config/plan or '-' for stdout")
+
+    p_mig_path = sub.add_parser("migrate-path", help="Safely migrate layout from .setting to .boss-orchestrator preserving schema, routing, and user prose")
+    p_mig_path.add_argument("--root", type=Path, default=Path.cwd(), help="Workspace root")
+    p_mig_path.add_argument("--plan", type=str, help="Optional output path for migration plan JSON or '-' for stdout")
+    p_mig_path.add_argument("--apply", action="store_true", help="Apply the migration plan directly")
+    p_mig_path.add_argument("--from-plan", type=str, help="Path to existing migration plan JSON to apply")
+    p_mig_path.add_argument("--confirmed", action="store_true", help="Confirm execution gate for applying migration")
 
     args = parser.parse_args()
     try:
@@ -1362,7 +1865,7 @@ def main() -> int:
             if args.config == "-":
                 raw_text = sys.stdin.read()
             else:
-                cpath = Path(args.config) if args.config else (args.root / ".setting/config.md")
+                cpath = Path(args.config) if args.config else _find_default_config(args.root)
                 if not cpath.is_file():
                     raise InitError(f"Config file not found: {cpath}")
                 raw_text = cpath.read_bytes().decode("utf-8")
@@ -1377,15 +1880,20 @@ def main() -> int:
             return 0
 
         elif args.cmd == "plan":
-            if args.config == "-":
-                raw_text = sys.stdin.read()
+            if getattr(args, "path_only", False):
+                plan_data = make_path_migration_plan(args.root)
             else:
-                cpath = Path(args.config)
-                if not cpath.is_file():
-                    raise InitError(f"Config file not found: {cpath}")
-                raw_text = cpath.read_bytes().decode("utf-8")
+                if not args.config:
+                    raise InitError("Missing required --config argument for plan (or use --path-only for path migration)")
+                if args.config == "-":
+                    raw_text = sys.stdin.read()
+                else:
+                    cpath = Path(args.config)
+                    if not cpath.is_file():
+                        raise InitError(f"Config file not found: {cpath}")
+                    raw_text = cpath.read_bytes().decode("utf-8")
+                plan_data = make_plan(args.root, raw_text)
 
-            plan_data = make_plan(args.root, raw_text)
             out_json = json.dumps(plan_data, indent=2)
 
             if args.out and args.out != "-":
@@ -1428,8 +1936,45 @@ def main() -> int:
             print(json.dumps(st, indent=2))
             return 0 if st.get("status") == "active" else 1
 
+        elif args.cmd == "migrate-path":
+            if args.apply:
+                if args.from_plan:
+                    ppath = Path(args.from_plan)
+                    if not ppath.is_file():
+                        raise InitError(f"Plan file not found: {ppath}")
+                    raw_json = ppath.read_bytes().decode("utf-8")
+                    pdata = json.loads(raw_json)
+                else:
+                    pdata = make_path_migration_plan(args.root)
+                code, msg = apply_path_migration_plan(args.root, pdata, args.confirmed)
+                print(msg)
+                return code
+            else:
+                plan_data = make_path_migration_plan(args.root)
+                out_json = json.dumps(plan_data, indent=2)
+                if args.plan and args.plan != "-":
+                    out_path = Path(args.plan)
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    out_path.write_bytes(out_json.encode("utf-8"))
+                    print(f"Path migration plan saved to {args.plan}")
+                else:
+                    print(out_json)
+                return 0
+
         elif args.cmd == "migrate":
-            cpath = Path(args.config) if args.config else (args.root / ".setting/config.md")
+            if getattr(args, "path_only", False):
+                plan_data = make_path_migration_plan(args.root)
+                out_json = json.dumps(plan_data, indent=2)
+                if args.out and args.out != "-":
+                    out_path = Path(args.out)
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    out_path.write_bytes(out_json.encode("utf-8"))
+                    print(f"Path migration plan saved to {args.out}")
+                else:
+                    print(out_json)
+                return 0
+
+            cpath = Path(args.config) if args.config else _find_default_config(args.root)
             if not cpath.is_file():
                 raise InitError(f"Config file not found: {cpath}")
             raw_text = cpath.read_bytes().decode("utf-8")

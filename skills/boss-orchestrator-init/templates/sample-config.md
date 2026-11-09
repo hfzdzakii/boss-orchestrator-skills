@@ -1,6 +1,6 @@
 # boss-orchestrator workspace config (sample template v2)
 
-Read by `.setting/boss-orchestrator.md`. The single fenced `json` block below is the only
+Read by `.boss-orchestrator/runtime-policy.md`. The single fenced `json` block below is the only
 machine-read part of this file; `null` means unresolved, never wildcard or permission.
 In schema_version 2, the order of enabled entries in `workers[]` defines provider priority
 (first enabled worker = highest priority). Exactly one enabled route is allowed per provider instance.

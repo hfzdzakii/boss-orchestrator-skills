@@ -30,9 +30,11 @@ First, observe harness capabilities and target workspace:
   ```bash
   python "<SKILL_DIR>/scripts/boss_init.py" status --root <WORKSPACE_ROOT>
   ```
-- If `.setting/config.md` already exists:
-  - If it is legacy `schema_version: 1`, report the legacy active status. When updating or reconfiguring, detect provider conflicts and use `migrate` to draft a `schema_version: 2` configuration. Do not silently overwrite v1.
-  - Determine if the user wants an update, migration to v2, or fresh initialization.
+- If `.boss-orchestrator/config.md` or legacy `.setting/config.md` already exists:
+  - If `.boss-orchestrator/config.md` exists: report active/inactive status.
+  - If legacy `.setting/config.md` exists and `.boss-orchestrator/config.md` does not: report legacy status. Safe path-only migration (`migrate-path`) or v2 migration (`migrate`) is available. Do not silently overwrite v1.
+  - If both layouts exist: fail clearly with conflict to prevent ambiguous orchestration.
+  - Determine if the user wants an update, path migration, v2 migration, or fresh initialization.
 
 ### 2. Conversational Inventory Presentation (Single Turn)
 
@@ -44,7 +46,7 @@ Separate observable facts from user decisions without running sequential intervi
   2. **Explicit thinking options:** Model options and thinking parameters must be explicit (`thinking.option_key`, `thinking.selected`, `thinking.allowed_values`); default/implicit thinking is disallowed for enabled workers.
   3. **First-written priority (`boss.priority: provider_order`):** The order in which the user lists providers directly defines priority (first listed provider = Priority 1 primary dispatch, second = Priority 2, etc.). Redundant fallback arrays are removed.
   4. **Dynamic multi-instance execution:** Static 1-route config does not restrict runtime concurrency; the boss can summon multiple independent task instances on disjoint scopes within harness capacity.
-  5. **Queue capacity:** Priority 1 handles all new task dispatches while eligible and capacity is available. If Priority 1 capacity is full, **QUEUE**; do not spill to Priority 2 solely for speed.
+  5. **Queue capacity:** Priority 1 handles all new task dispatches while eligible and capacity is available. If Priority 1 capacity is full, **QUEUE**; do not spill to Priority 2 solely for speed. Queueing is an instruction policy: the top-level orchestrator holds tasks within the conversational turn rather than relying on an automatic background scheduler daemon or service.
   6. **Operational fallback with partial-work handoff:** On auth, quota, connection, or service error, immediately advance to the next eligible priority. Generate a structured handoff brief preserving filesystem partial work (do not restart from scratch by default).
   7. **2 no-progress correction rounds:** Give concrete quality feedback first; 2 consecutive rounds with no measurable progress switches provider; exhausting all providers escalates unaccepted (`boss.after_change: escalate`) without fallback to parent or builtin models.
   8. **Session-only 5 accepted lower-task recovery (`boss.retry_after_successful_tasks: 5`):** After 5 successfully completed and parent-accepted worker tasks on lower-priority provider(s), retry ONE real task on the higher-priority provider. Session reset starts clean at Priority 1.
@@ -64,7 +66,7 @@ In the subsequent turn, process the user's ordinary chat reply:
 - **User Selection is NOT Activation Approval:**
   - User selection establishes candidate routes and priority ordering. It does NOT authorize file changes or workspace activation.
   - Candidate execution probes (if authorized/needed) run only after selection as part of the existing authorized flow, with explicit user permission before any probe execution.
-  - Strictly NO managed files (`AGENTS.md`, `.setting/config.md`, `.setting/boss-orchestrator.md`, `.setting/plan.json`) may be written before explicit confirmation in chat.
+  - Strictly NO managed files (`AGENTS.md`, `.boss-orchestrator/config.md`, `.boss-orchestrator/runtime-policy.md`, `.gitignore`) may be written before explicit confirmation in chat.
 
 ### 4. Draft in Memory & Generate Exact Diff (Preview)
 
@@ -93,12 +95,12 @@ Generate the exact plan and diff in memory or to stdout without modifying files 
 # Pipe drafted config (requires exactly one markdown fenced JSON block) to plan helper
 python "<SKILL_DIR>/scripts/boss_init.py" plan --root <WORKSPACE_ROOT> --config -
 ```
-**Do not write `.setting/config.md` or `.setting/plan.json` before obtaining user confirmation.**
+**Do not write `.boss-orchestrator/config.md`, `.boss-orchestrator/runtime-policy.md`, or `.gitignore` before obtaining user confirmation.**
 
 Present the summary to the user in ordinary chat:
 - Candidate workers (enabled in priority order and disabled alternatives with reasons).
 - Ordered routing rules: Priority 1 primary dispatch, capacity queueing without spill, operational advance, 2-round quality escalation, 5-task session-only recovery trial.
-- Exact file diffs for `AGENTS.md`, `.setting/config.md`, and `.setting/boss-orchestrator.md`.
+- Exact file diffs for `AGENTS.md`, `.boss-orchestrator/config.md`, `.boss-orchestrator/runtime-policy.md`, and `.gitignore`.
 
 ### 5. Explicit User Confirmation
 
@@ -123,11 +125,11 @@ Once confirmed by the user in chat:
 
 Once initialized, top-level parent sessions in this workspace operate under these rules:
 - **Parent Role:** Keeps current model (`current_active`). Delegates all substantive tasks (coding, docs, tests, Git commands, builds).
-- **Ordered Priority (`boss.priority: provider_order`):** Worker order in `workers[]` determines priority. Dispatch to Priority 1 for all new tasks while eligible and capacity available. If Priority 1 capacity is full, **QUEUE**; do not spill to Priority 2 solely for speed.
+- **Ordered Priority (`boss.priority: provider_order`):** Worker order in `workers[]` determines priority. Dispatch to Priority 1 for all new tasks while eligible and capacity available. If Priority 1 capacity is full, **QUEUE**; do not spill to Priority 2 solely for speed (instruction-governed within turn, no background auto scheduler daemon).
 - **Dynamic Multi-Instance Execution:** One static enabled route per provider instance. Boss can summon multiple independent task instances (`taskId` / `clientRequestId` unique) on disjoint scopes within harness capacity.
 - **Operational Failures & Handoff:** On auth, quota, connection, or service error, immediately stop dispatching on the affected provider and advance to the next eligible priority. Perform a structured handoff (goal, files/diff, completed/partial steps, test revision evidence, errors, cancellation side effects, next action). Preserve filesystem partial work; do not restart from scratch by default.
 - **Quality First & Escalation:** Give concrete feedback first. 2 consecutive correction rounds with no measurable progress (`boss.no_progress_rounds: 2`) switches to the next provider. If all providers are exhausted, escalate unaccepted (`boss.after_change: escalate`). Never fall back to parent or builtin models.
 - **Session-Only Recovery (`boss.retry_after_successful_tasks: 5`):** After 5 successfully completed and parent-accepted worker tasks on lower-priority provider(s), the boss may retry ONE real task on the higher-priority provider. Counted once per unique task ID only after parent acceptance. 1 trial at a time. Succeeded trial restores provider; failed trial resets counter to 0. Session reset starts clean at Priority 1.
 - **Small Review Fixes:** The parent may fix small clear local review findings itself when required by harness instructions, provided they do not touch design, behavior, dependencies, permissions, or require investigation.
-- **Matt Pocock Coexistence:** Preserves existing `## Agent skills` block and other content outside the marker blocks in `AGENTS.md` and user prose in `.setting/config.md`.
+- **Matt Pocock Coexistence:** Preserves existing `## Agent skills` block and other content outside the marker blocks in `AGENTS.md` and user prose in `.boss-orchestrator/config.md`.
 - **Startup:** Lightweight check (`boss_init.py status --root .`) at session start. Active only when `state == "enabled"`.
