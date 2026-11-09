@@ -54,3 +54,24 @@
 ## Discovery and Scope Verification
 - **Root Workspace State**: Preserved untouched on disk. Currently active under legacy `schema_version: 1` (`lason`, `nia`, `hafizh`, `rizpedia`). No unapproved root changes, commits, or npm publishes made.
 - **Model Probes**: No network or paid model probes conducted.
+
+## Conversational Initialization Invariants and Skill Validation
+- **Skill Specification Validation**: Validated via `quick_validate.py` (0 errors, valid frontmatter and structure).
+- **Conversational Single-Turn Discovery**:
+  - Read-only scanning of active provider instances without execution probes.
+  - Inventory emitted in ONE complete ordinary chat response detailing: 1 model per provider, explicit thinking options, first-written priority, multi-instance concurrency, queue capacity, operational fallback with partial-work handoff, 2 no-progress rounds, session-only 5 accepted lower-task recovery.
+  - Grounded copyable ordered reply example provided.
+  - Turn ended immediately to await user selection in ordinary chat.
+  - Strict prohibition of grilling skills (`grilling`, `grill-me`), interactive modal forms (`ask_question`, `request_user_input`), or sequential interview rounds.
+- **Ordinary Chat Selection & Targeted Clarification**:
+  - Parses ordered reply to establish priority order and route selections.
+  - Targeted ordinary chat clarification strictly focused on missing/ambiguous choices while preserving established choices without re-opening settled decisions.
+- **Activation Gate Integrity**:
+  - User selection does NOT constitute activation approval.
+  - Execution probes run only after selection with explicit user consent.
+  - Draft and preview diff generated in memory via plan helper without modifying files on disk.
+  - Explicit affirmative user confirmation in chat required before apply.
+- **Explicit-only Metadata Preservation**:
+  - Skill metadata maintains `policy.allow_implicit_invocation: false` in `agents/openai.yaml`.
+  - Schema version 2 ordered-provider invariants and SessionRouter state machine preserved without modification.
+

@@ -3,7 +3,7 @@
 Deterministic, workspace-local initialization package for boss-orchestrator workflows.
 
 This package provides:
-1. **The `boss-orchestrator-init` skill**: Guides the AI agent through preflight, fact discovery, interviewing user preference frontiers, drafting the configuration in memory, and securing explicit confirmation under the ordered-provider policy.
+1. **The `boss-orchestrator-init` skill**: Guides the AI agent through preflight, read-only harness and provider discovery, presenting inventory and routing principles in a single conversational turn, parsing user ordering and model choices in ordinary chat, drafting the configuration in memory, and securing explicit confirmation under the ordered-provider policy.
 2. **Deterministic helper (`scripts/boss_init.py`)**: A pure standard-library Python CLI that validates schema (v1 legacy and v2 ordered policy), renders managed files, computes raw byte before/after SHA256 hashes, generates diffs, guards against stale plans and tampering, checks reparse points / symlinks, preserves CRLF / BOM and user prose, executes atomic binary writes with rollback, drafts migrations from v1, and provides a pure deterministic session routing verification and reference state machine (`SessionRouter`). Note that live routing during task execution is instruction-governed by the top-level orchestrator agent without runtime harness middleware or hooks.
 3. **Runtime policy (`references/runtime-policy.md`)**: A self-contained, versioned runtime contract (v2) copied into `.setting/boss-orchestrator.md` on initialization.
 4. **Unit test suite (`tests/test_boss_init.py`)**: Thorough verification of safety, boundaries, parsing, migration, and the deterministic session routing state machine using Python stdlib `unittest`.

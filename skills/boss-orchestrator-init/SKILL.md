@@ -34,17 +34,39 @@ First, observe harness capabilities and target workspace:
   - If it is legacy `schema_version: 1`, report the legacy active status. When updating or reconfiguring, detect provider conflicts and use `migrate` to draft a `schema_version: 2` configuration. Do not silently overwrite v1.
   - Determine if the user wants an update, migration to v2, or fresh initialization.
 
-### 2. Provider Discovery vs. User Decisions (Ordered Policy)
+### 2. Conversational Inventory Presentation (Single Turn)
 
-Separate observable facts from user preferences:
-- **Facts (Agent observes):** Scan ALL available providers from actual harness discovery. Display ALL active eligible provider instances (`providerInstanceId`, distinguishing active vs disabled, without inferring authorization success or upstream quota independence), along with available models and options. Different named instances (e.g. `antigravity` vs `antigravity_2`) are distinct provider entries. Do not copy the entire model catalog into `workers[]`.
-- **Decisions (User decides):** Ask the user to choose exactly ONE allowed model and options per included provider instance, and submit an ordered list.
-  - Explicitly: the first written provider = highest priority (Priority 1), followed by Priority 2, etc.
-  - Unselected providers are excluded; unresolved alternatives remain `enabled: false` with `disabled_reason: "inactive provider route alternative"`.
-  - Request user consent before running any execution verification probes.
-- Do not re-interview settled decisions (e.g. parent sentinel `current_active`, 2-round no-progress escalation, Matt Pocock coexistence).
+Separate observable facts from user decisions without running sequential interviews or interactive forms:
+- **No Grilling or Form Modals:** Do not invoke the `grilling` or `grill-me` skills. Do not use interactive UI forms, modal dialogs, or input tools (`ask_question`, `request_user_input`, `AskUserQuestion`, Plan mode forms). Do not conduct a sequential, multi-turn interview asking questions one by one.
+- **Read-Only Inventory Discovery (Observable Facts):** Scan ALL available providers from actual harness discovery without running network probes. Enumerate all active eligible provider instances (`providerInstanceId`, distinguishing active vs disabled, without inferring authorization success or upstream quota independence), along with available models and options. Different named instances (e.g. `antigravity` vs `antigravity_2`) are distinct provider entries. State unknown or unavailable properties explicitly (e.g. unknown upstream mappings, pool weights, or unavailable options). Do not copy the entire model catalog into `workers[]`.
+- **Emit ONE Complete Ordinary Chat Response:** Provide a single clear conversational chat message that explains the discovered inventory and details the core operating rules the user's selection will govern:
+  1. **One model per provider:** Exactly one enabled worker route per provider instance.
+  2. **Explicit thinking options:** Model options and thinking parameters must be explicit (`thinking.option_key`, `thinking.selected`, `thinking.allowed_values`); default/implicit thinking is disallowed for enabled workers.
+  3. **First-written priority (`boss.priority: provider_order`):** The order in which the user lists providers directly defines priority (first listed provider = Priority 1 primary dispatch, second = Priority 2, etc.). Redundant fallback arrays are removed.
+  4. **Dynamic multi-instance execution:** Static 1-route config does not restrict runtime concurrency; the boss can summon multiple independent task instances on disjoint scopes within harness capacity.
+  5. **Queue capacity:** Priority 1 handles all new task dispatches while eligible and capacity is available. If Priority 1 capacity is full, **QUEUE**; do not spill to Priority 2 solely for speed.
+  6. **Operational fallback with partial-work handoff:** On auth, quota, connection, or service error, immediately advance to the next eligible priority. Generate a structured handoff brief preserving filesystem partial work (do not restart from scratch by default).
+  7. **2 no-progress correction rounds:** Give concrete quality feedback first; 2 consecutive rounds with no measurable progress switches provider; exhausting all providers escalates unaccepted (`boss.after_change: escalate`) without fallback to parent or builtin models.
+  8. **Session-only 5 accepted lower-task recovery (`boss.retry_after_successful_tasks: 5`):** After 5 successfully completed and parent-accepted worker tasks on lower-priority provider(s), retry ONE real task on the higher-priority provider. Session reset starts clean at Priority 1.
+- **Copyable Ordered Reply Example:** Include a copyable ordered template grounded directly in the discovered provider instance IDs, model route IDs, and explicit option values so the user can easily paste and edit their selection.
+- **End Turn:** Stop calling tools and end the turn immediately after emitting the inventory response to await the user's selection in ordinary chat.
 
-### 3. Draft in Memory & Generate Exact Diff
+### 3. Parse User Selection & Clarify Missing Choices
+
+In the subsequent turn, process the user's ordinary chat reply:
+- **Parse Selection & Priority Order:**
+  - Extract the ordered list of provider instances, selected model per provider instance, and explicit options/thinking.
+  - The first provider in the user's list becomes Priority 1, the second becomes Priority 2, etc.
+  - Unselected providers are excluded from active routing; unselected route alternatives remain `enabled: false` with `disabled_reason: "inactive provider route alternative"`.
+- **Targeted Ordinary Chat Clarification:**
+  - If the user's reply is ambiguous or missing essential choices (e.g. missing an explicit thinking level or model selection for an included provider), ask for clarification via ordinary chat focused strictly on the missing part.
+  - Preserve all known and established choices. Do not restart the discovery presentation or re-open settled decisions (e.g. parent sentinel `current_active`, 2-round no-progress escalation, Matt Pocock coexistence).
+- **User Selection is NOT Activation Approval:**
+  - User selection establishes candidate routes and priority ordering. It does NOT authorize file changes or workspace activation.
+  - Candidate execution probes (if authorized/needed) run only after selection as part of the existing authorized flow, with explicit user permission before any probe execution.
+  - Strictly NO managed files (`AGENTS.md`, `.setting/config.md`, `.setting/boss-orchestrator.md`, `.setting/plan.json`) may be written before explicit confirmation in chat.
+
+### 4. Draft in Memory & Generate Exact Diff (Preview)
 
 Prepare the `schema_version: 2` configuration in memory adhering to the schema:
 - `parent.selection`: always `current_active` (sentinel, never switch parent model).
@@ -73,19 +95,19 @@ python "<SKILL_DIR>/scripts/boss_init.py" plan --root <WORKSPACE_ROOT> --config 
 ```
 **Do not write `.setting/config.md` or `.setting/plan.json` before obtaining user confirmation.**
 
-Present the summary to the user:
+Present the summary to the user in ordinary chat:
 - Candidate workers (enabled in priority order and disabled alternatives with reasons).
 - Ordered routing rules: Priority 1 primary dispatch, capacity queueing without spill, operational advance, 2-round quality escalation, 5-task session-only recovery trial.
 - Exact file diffs for `AGENTS.md`, `.setting/config.md`, and `.setting/boss-orchestrator.md`.
 
-### 4. Explicit User Confirmation
+### 5. Explicit User Confirmation
 
-Ask the user explicitly:
+Ask the user explicitly in ordinary chat:
 > "Do you approve the configuration, priority ordering, routing rules, review exception, and file changes above to initialize boss orchestration in this workspace?"
 
 **A CLI flag (`--confirmed`) is an execution gate, NOT human consent.** Do not proceed to write files without the user's explicit affirmative response in chat.
 
-### 5. Deterministic Plan and Apply
+### 6. Deterministic Plan and Apply
 
 Once confirmed by the user in chat:
 1. Generate the plan and pipe directly to apply via stdin (stdin input requires exactly one markdown fenced JSON block):
